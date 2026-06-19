@@ -831,6 +831,37 @@ def send_response(conn, addr, response):
         print(f"[{now()}] SEND ERROR {addr}: {e}")
 
 
+def cleanup_disconnect(conn, addr, port):
+    # 연결이 어떤 식으로 끊겼든(정상 종료/소켓 에러/예외) 항상 호출되어
+    # 죽은 연결을 clients/sessions에서 제거한다. 정리를 건너뛰면 죽은
+    # 연결이 유령으로 남아 다른 유저 목록/접속을 망가뜨린다.
+    disconnected_user = get_client_user(conn)
+
+    if port != 6112:
+        return
+
+    with lock:
+        for client in list(clients):
+            if client["conn"] is conn:
+                clients.remove(client)
+
+        # 이 conn이 현재 세션의 주인일 때만 세션을 지운다.
+        # (이미 다른 새 연결로 대체됐다면 그 세션은 건드리지 않는다.)
+        if disconnected_user != "unknown":
+            session = sessions.get(disconnected_user)
+            if session and session.get("conn") is conn:
+                sessions.pop(disconnected_user, None)
+
+    if disconnected_user != "unknown":
+        print(
+            "[DISCONNECT] keep advertised rooms until TTL "
+            f"user={disconnected_user}"
+        )
+
+    print(f"[DISCONNECT] user={disconnected_user}")
+    print_state("DISCONNECT")
+
+
 def tcp_server(port):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -854,12 +885,17 @@ def tcp_server(port):
         def handle_client():
             remain = b""
 
-            with conn:
+            try:
                 while True:
                     try:
                         data = conn.recv(4096)
-                    except ConnectionResetError:
+                    except (ConnectionResetError, ConnectionAbortedError):
                         print(f"[{now()}] TCP reset by client {addr}")
+                        break
+                    except OSError as e:
+                        # 소켓이 다른 경로에서 닫혔거나(WinError 10038 등) 비정상
+                        # 종료된 경우. 스레드를 죽이지 말고 깔끔히 빠져나간다.
+                        print(f"[{now()}] TCP recv error {addr}: {e}")
                         break
 
                     if not data:
@@ -888,28 +924,10 @@ def tcp_server(port):
 
                         for response in responses:
                             send_response(conn, addr, response)
-
-            disconnected_user = get_client_user(conn)
-
-            if port == 6112:
-                with lock:
-                    for client in list(clients):
-                        if client["conn"] is conn:
-                            clients.remove(client)
-
-                    if disconnected_user != "unknown":
-                        session = sessions.get(disconnected_user)
-                        if session and session.get("conn") is conn:
-                            sessions.pop(disconnected_user, None)
-
-                if disconnected_user != "unknown":
-                    print(
-                        "[DISCONNECT] keep advertised rooms until TTL "
-                        f"user={disconnected_user}"
-                    )
-
-                print(f"[DISCONNECT] user={disconnected_user}")
-                print_state("DISCONNECT")
+            finally:
+                # 정상 종료/소켓 에러/예외 어느 경우든 반드시 정리한다.
+                close_socket_quietly(conn)
+                cleanup_disconnect(conn, addr, port)
 
         threading.Thread(target=handle_client, daemon=True).start()
 
