@@ -317,6 +317,44 @@ def broadcast_chat(packet):
                 clients.remove(client)
 
 
+def broadcast_room_list_to_lobby(except_conn=None):
+    """Push user list + room list to all lobby-state clients.
+
+    Called after a room is created/removed so guests see the update without
+    having to press the room-list button again.
+    """
+    remove_stale_rooms()
+    with lock:
+        room_snapshot = [dict(room) for room in rooms]
+        targets = [
+            (client["conn"], client["addr"], client.get("user_id", "unknown"))
+            for client in list(clients)
+            if (
+                client.get("user_id") not in (None, "unknown")
+                and (except_conn is None or client["conn"] is not except_conn)
+                and sessions.get(
+                    client.get("user_id", ""), {}
+                ).get("state", "lobby") == "lobby"
+            )
+        ]
+
+    if not targets:
+        return
+
+    active_users = get_active_users()
+    combined = b"".join(
+        make_channel_user_list_packets(active_users)
+        + make_room_list_packets(room_snapshot)
+    )
+
+    for conn, addr, user_id in targets:
+        try:
+            conn.sendall(combined)
+            print(f"[ROOM LIST PUSH] -> {addr} ({user_id})")
+        except OSError as e:
+            print(f"[ROOM LIST PUSH FAIL] {addr}: {e}")
+
+
 def make_empty_room_list_packets():
     return [
         make_packet(0x0CFF, b""),
@@ -650,11 +688,20 @@ def get_responses(conn, addr, packet_type, body):
             print(f"[LOGIN OK] id={user_id}")
             print_state("LOGIN")
 
-            # 로그인 직후 로비 채널 입장 패킷(0x09/0x0A/0x0B)을 함께 보낸다.
-            # 이게 없으면 클라이언트가 "채널에 안 들어간" 상태가 되어,
-            # 방만들기는 되지만 "참전"으로 방목록을 볼 때 0x0BFF 요청을
-            # 못 보내고 "방리스트 요청중"에서 멈춘다.
-            return [make_packet(0x05FF, b"\x00\x00")] + make_lobby_rejoin_packets()
+            # 로그인 직후 채널 입장(0x09/0x0A/0x0B) + 유저/방 목록을 함께 보낸다.
+            # 채널 입장만 보내면 일부 클라이언트(test1 등)가 "방목록 버튼" 클릭 시
+            # 서버에 0x0BFF를 보내지 않고 서버 push를 기다리며 멈춘다.
+            # 로그인 즉시 현재 목록을 내려주면 다이얼로그가 즉시 해소된다.
+            remove_stale_rooms()
+            with lock:
+                room_snapshot_login = [dict(room) for room in rooms]
+            active_users_login = get_active_users()
+            return (
+                [make_packet(0x05FF, b"\x00\x00")]
+                + make_lobby_rejoin_packets()
+                + make_channel_user_list_packets(active_users_login)
+                + make_room_list_packets(room_snapshot_login)
+            )
 
         print("[LOGIN FAILED] invalid body")
         return [make_packet(0x05FF, b"\x04\x00")]
@@ -675,7 +722,9 @@ def get_responses(conn, addr, packet_type, body):
             room_snapshot = [dict(room) for room in rooms]
 
         print(f"[ROOM LIST REQUEST] user={user}, rooms={len(room_snapshot)}")
-        active_users = get_lobby_users(include_user=user)
+        # 방 안에 있는 유저도 채널 유저 목록에 표시한다. 일부 클라이언트가
+        # 유저 목록에 없는 유저가 만든 방 항목을 처리하지 못하기 때문이다.
+        active_users = get_active_users()
         print(f"[ROOM LIST USERS] users={[item['user_id'] for item in active_users]}")
 
         for room in room_snapshot:
@@ -690,7 +739,7 @@ def get_responses(conn, addr, packet_type, body):
 
     if packet_type == 0x1FFF:
         user = get_client_user(conn)
-        users = get_lobby_users(include_user=user)
+        users = get_active_users()
 
         print(
             "[CHANNEL USER LIST REQUEST] "
@@ -746,6 +795,11 @@ def get_responses(conn, addr, packet_type, body):
         })
         set_user_state(creator, "room", get_room_name(body))
 
+        # 방이 생성됐음을 로비에 있는 다른 유저들에게 즉시 push한다.
+        # 방목록 버튼 클릭 시 서버 push를 기다리는 클라이언트(test1 등)가
+        # "방리스트 요청중" 다이얼로그에서 멈추지 않도록 한다.
+        broadcast_room_list_to_lobby(except_conn=conn)
+
         if reported_by_other:
             print(f"[ROOM CREATE SYNCED] reporter={session_user}, owner={creator}")
         print("[ROOM CREATE OK]")
@@ -799,8 +853,17 @@ def get_responses(conn, addr, packet_type, body):
             print_state("ROOM_EXIT")
 
         # ack만 보내면 클라이언트가 "채널을 조인중입니다"에서 멈춘다.
-        # 채널 재조인 패킷(0x09/0x0A/0x0B)을 함께 내려 로비로 복귀시킨다.
-        return [make_packet(0x11FF, b"\x00\x00")] + make_lobby_rejoin_packets()
+        # 채널 재조인(0x09/0x0A/0x0B) + 유저/방 목록을 함께 내려 로비로 복귀시킨다.
+        remove_stale_rooms()
+        with lock:
+            room_snapshot_exit = [dict(room) for room in rooms]
+        active_users_exit = get_active_users()
+        return (
+            [make_packet(0x11FF, b"\x00\x00")]
+            + make_lobby_rejoin_packets()
+            + make_channel_user_list_packets(active_users_exit)
+            + make_room_list_packets(room_snapshot_exit)
+        )
 
     # 채팅
     if packet_type == 0x12FF:
@@ -831,8 +894,17 @@ def get_responses(conn, addr, packet_type, body):
 
         # 게임 종료 후 점수판에서 '확인'을 누르면 로비 채널로 복귀해야 한다.
         # ack(0x24FF)만 보내면 "채널을 조인중입니다"에서 멈추므로
-        # 채널 재조인 패킷(0x09/0x0A/0x0B)을 함께 내려준다.
-        return [make_packet(0x24FF, b"\x00\x00")] + make_lobby_rejoin_packets()
+        # 채널 재조인(0x09/0x0A/0x0B) + 유저/방 목록을 함께 내려준다.
+        remove_stale_rooms()
+        with lock:
+            room_snapshot_game = [dict(room) for room in rooms]
+        active_users_game = get_active_users()
+        return (
+            [make_packet(0x24FF, b"\x00\x00")]
+            + make_lobby_rejoin_packets()
+            + make_channel_user_list_packets(active_users_game)
+            + make_room_list_packets(room_snapshot_game)
+        )
 
     return [make_packet(packet_type, b"\x00\x00")]
 
