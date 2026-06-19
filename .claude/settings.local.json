@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git branch *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(python -m py_compile dummyserver.py)",
+      "Bash(\"/c/Users/seo/AppData/Local/Programs/Python/Python314/python.exe\" -m py_compile \"C:/Users/seo/Documents/왕건-claude/dummyserver.py\")",
+      "Bash(grep -n \"old_conn\" \"C:/Program Files/태조왕건/dummyserver.py\" 2>&1 | head; echo \"---running file old_conn init line above \\(if missing 'old_conn = None' before the with-lock, it is stale\\)---\")",
+      "Bash(cp \"C:/Users/seo/Documents/왕건-claude/dummyserver.py\" \"C:/Program Files/태조왕건/dummyserver.py\" 2>&1 && echo \"COPIED OK\" || echo \"COPY FAILED \\(need admin\\)\")"
+    ]
+  }
+}

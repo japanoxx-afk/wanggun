@@ -782,7 +782,9 @@ def get_responses(conn, addr, packet_type, body):
             set_user_state(user, "lobby", None)
             print_state("ROOM_EXIT")
 
-        return [make_packet(0x11FF, b"\x00\x00")]
+        # ack만 보내면 클라이언트가 "채널을 조인중입니다"에서 멈춘다.
+        # 채널 재조인 패킷(0x09/0x0A/0x0B)을 함께 내려 로비로 복귀시킨다.
+        return [make_packet(0x11FF, b"\x00\x00")] + make_lobby_rejoin_packets()
 
     # 채팅
     if packet_type == 0x12FF:
@@ -810,7 +812,11 @@ def get_responses(conn, addr, packet_type, body):
             leave_room_state(user)
             set_user_state(user, "lobby", None)
             print_state("GAME_REPORT")
-        return [make_packet(0x24FF, b"\x00\x00")]
+
+        # 게임 종료 후 점수판에서 '확인'을 누르면 로비 채널로 복귀해야 한다.
+        # ack(0x24FF)만 보내면 "채널을 조인중입니다"에서 멈추므로
+        # 채널 재조인 패킷(0x09/0x0A/0x0B)을 함께 내려준다.
+        return [make_packet(0x24FF, b"\x00\x00")] + make_lobby_rejoin_packets()
 
     return [make_packet(packet_type, b"\x00\x00")]
 
