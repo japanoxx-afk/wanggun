@@ -342,8 +342,12 @@ def broadcast_room_list_to_lobby(except_conn=None):
         return
 
     active_users = get_active_users()
+    # 0x0BFF (채널 조인 알림)를 먼저 보내 클라이언트의 방 목록 수신 대기를
+    # 트리거한다. test1 계열 클라이언트가 0x0BFF를 받아야 push된 방 목록을
+    # 처리하는 것으로 보인다.
     combined = b"".join(
-        make_channel_user_list_packets(active_users)
+        [make_packet(0x0BFF, b"\x00" + DEFAULT_CHANNEL_NAME)]
+        + make_channel_user_list_packets(active_users)
         + make_room_list_packets(room_snapshot)
     )
 
@@ -852,17 +856,17 @@ def get_responses(conn, addr, packet_type, body):
             set_user_state(user, "lobby", None)
             print_state("ROOM_EXIT")
 
-        # ack만 보내면 클라이언트가 "채널을 조인중입니다"에서 멈춘다.
-        # 채널 재조인(0x09/0x0A/0x0B) + 유저/방 목록을 함께 내려 로비로 복귀시킨다.
-        remove_stale_rooms()
-        with lock:
-            room_snapshot_exit = [dict(room) for room in rooms]
-        active_users_exit = get_active_users()
+        # 방이 제거됐으므로 로비에 있는 다른 클라이언트에게 방 목록을 push한다.
+        broadcast_room_list_to_lobby(except_conn=conn)
+
+        # ack + 채널 재조인(0x09/0x0A/0x0B)만 보낸다.
+        # inline으로 유저/방 목록까지 보내면 클라이언트가 채널 재조인 시퀀스 도중
+        # 받은 목록 패킷을 처리하지 못하고 로비 복귀에 실패할 수 있다.
+        # 클라이언트는 0x0BFF를 받은 후 자연스럽게 0x0BFF 요청을 보내고
+        # 서버가 그에 응답해 목록을 받는다.
         return (
             [make_packet(0x11FF, b"\x00\x00")]
             + make_lobby_rejoin_packets()
-            + make_channel_user_list_packets(active_users_exit)
-            + make_room_list_packets(room_snapshot_exit)
         )
 
     # 채팅
@@ -894,16 +898,13 @@ def get_responses(conn, addr, packet_type, body):
 
         # 게임 종료 후 점수판에서 '확인'을 누르면 로비 채널로 복귀해야 한다.
         # ack(0x24FF)만 보내면 "채널을 조인중입니다"에서 멈추므로
-        # 채널 재조인(0x09/0x0A/0x0B) + 유저/방 목록을 함께 내려준다.
-        remove_stale_rooms()
-        with lock:
-            room_snapshot_game = [dict(room) for room in rooms]
-        active_users_game = get_active_users()
+        # 채널 재조인(0x09/0x0A/0x0B)을 함께 내려준다.
+        # 유저/방 목록은 inline으로 보내지 않고, 채널 재조인 후 클라이언트가
+        # 자연스럽게 0x0BFF를 보내면 그 응답으로 보낸다.
+        broadcast_room_list_to_lobby(except_conn=conn)
         return (
             [make_packet(0x24FF, b"\x00\x00")]
             + make_lobby_rejoin_packets()
-            + make_channel_user_list_packets(active_users_game)
-            + make_room_list_packets(room_snapshot_game)
         )
 
     return [make_packet(packet_type, b"\x00\x00")]
