@@ -650,7 +650,11 @@ def get_responses(conn, addr, packet_type, body):
             print(f"[LOGIN OK] id={user_id}")
             print_state("LOGIN")
 
-            return [make_packet(0x05FF, b"\x00\x00")]
+            # 로그인 직후 로비 채널 입장 패킷(0x09/0x0A/0x0B)을 함께 보낸다.
+            # 이게 없으면 클라이언트가 "채널에 안 들어간" 상태가 되어,
+            # 방만들기는 되지만 "참전"으로 방목록을 볼 때 0x0BFF 요청을
+            # 못 보내고 "방리스트 요청중"에서 멈춘다.
+            return [make_packet(0x05FF, b"\x00\x00")] + make_lobby_rejoin_packets()
 
         print("[LOGIN FAILED] invalid body")
         return [make_packet(0x05FF, b"\x04\x00")]
