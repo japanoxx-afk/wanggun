@@ -711,10 +711,22 @@ def get_responses(conn, addr, packet_type, body):
         return [make_packet(0x05FF, b"\x04\x00")]
 
     # 계정 / 닉네임 정보
+    # 클라이언트는 채널 재조인(0x09/0x0A/0x0B) 수신 후 0x07FF를 보낸다.
+    # 로그인·방 나가기 모두 동일한 패턴이다. 0x07FF 응답에 유저/방 목록을
+    # 함께 실어 주면, 클라이언트가 채널에 완전히 합류한 뒤 목록을 받게 되어
+    # 방 나가기 후에도 방 목록을 올바르게 표시할 수 있다.
     if packet_type == 0x07FF:
         user = get_client_user(conn)
         print(f"[ACCOUNT INFO] user={user}")
-        return [make_packet(0x07FF, b"\x00\x00")]
+        remove_stale_rooms()
+        with lock:
+            room_snapshot_07 = [dict(room) for room in rooms]
+        active_users_07 = get_active_users()
+        return (
+            [make_packet(0x07FF, b"\x00\x00")]
+            + make_channel_user_list_packets(active_users_07)
+            + make_room_list_packets(room_snapshot_07)
+        )
 
     # 방 목록 요청
     # 현재 방목록 항목 구조가 확인되지 않았으므로 빈 목록만 응답
