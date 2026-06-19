@@ -718,24 +718,36 @@ def get_responses(conn, addr, packet_type, body):
             print("[ROOM CREATE REJECTED] unknown session")
             return [make_packet(0x0EFF, b"\x01\x00")]
 
-        if session_user != "unknown" and body_owner and session_user != body_owner:
-            print("[ROOM CREATE REJECTED] session/body owner mismatch")
-            print(f"SESSION USER : {session_user}")
-            print(f"BODY OWNER   : {body_owner}")
-            print(f"BODY TEXT    : {body_text}")
-            print_state("ROOM_CREATE_REJECTED")
-            return [make_packet(0x0EFF, b"\x02\x00")]
+        # 이 게임은 방 정보를 IPX 브로드캐스트로 퍼뜨려서, 방 주인이 아닌
+        # 로비의 다른 클라이언트도 같은 방(owner=다른 유저)을 서버에 보고한다.
+        # 예전엔 session_user != body_owner면 거부(0x02 → "같은 이름의 방 존재")
+        # 했는데, 이게 옆 사람(test1) 화면을 깨고 방 주인의 방 등록까지 막아
+        # 방장(user_a)은 "방만들기 요청중"에서 멈췄다. 거부하지 말고 방 주인
+        # 명의로 등록한다.
+        reported_by_other = (
+            session_user != "unknown" and body_owner and session_user != body_owner
+        )
+
+        # 호스트 접속 주소는 방 주인의 세션 주소를 우선 사용한다. 주인이 아닌
+        # 사람이 보고하면 그 사람 주소가 호스트로 잘못 박히기 때문이다.
+        host_addr = addr
+        with lock:
+            owner_session = sessions.get(creator)
+            if owner_session and owner_session.get("addr"):
+                host_addr = owner_session["addr"]
 
         add_or_replace_room({
             "creator": creator,
-            "session_user": session_user,
-            "addr": addr,
+            "session_user": creator,
+            "addr": host_addr,
             "body": body,
             "created_at": datetime.datetime.now(),
             "players": [creator],
         })
         set_user_state(creator, "room", get_room_name(body))
 
+        if reported_by_other:
+            print(f"[ROOM CREATE SYNCED] reporter={session_user}, owner={creator}")
         print("[ROOM CREATE OK]")
         print(f"CREATOR       : {creator}")
         print(f"ROOM BODY HEX : {body.hex(' ')}")
