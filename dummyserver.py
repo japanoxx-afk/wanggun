@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import sys
+import traceback
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000]
@@ -868,7 +869,16 @@ def tcp_server(port):
                     for packet_type, packet_size, body in packets:
                         print_packet(port, addr, packet_type, packet_size, body)
 
-                        responses = get_responses(conn, addr, packet_type, body)
+                        try:
+                            responses = get_responses(conn, addr, packet_type, body)
+                        except Exception:
+                            # 한 패킷 처리 중 예외가 나도 연결을 끊지 않는다.
+                            # 핸들러 예외로 스레드가 죽으면 해당 유저의 접속이
+                            # 끊기고, 재접속/재로그인 과정에서 다른 유저(호스트)까지
+                            # 튕기는 것처럼 보일 수 있으므로 방어한다.
+                            print(f"[HANDLER ERROR] type=0x{packet_type:04X} from {addr}")
+                            traceback.print_exc()
+                            responses = [make_packet(packet_type, b"\x00\x00")]
 
                         for response in responses:
                             send_response(conn, addr, response)
