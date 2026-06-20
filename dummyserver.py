@@ -711,21 +711,27 @@ def get_responses(conn, addr, packet_type, body):
 
     # 계정 / 닉네임 정보
     # 클라이언트는 채널 재조인(0x09/0x0A/0x0B) 수신 후 0x07FF를 보낸다.
-    # 로그인·방 나가기 모두 동일한 패턴이다. 0x07FF 응답에 유저/방 목록을
-    # 함께 실어 주면, 클라이언트가 채널에 완전히 합류한 뒤 목록을 받게 되어
-    # 방 나가기 후에도 방 목록을 올바르게 표시할 수 있다.
+    #   · 로그인 직후: body = 게임이름(太祖王建, 9+ bytes)
+    #   · 방 나가기 후: body = \x00 (1 byte)
+    # 로그인 직후엔 이미 0x05FF 응답에 유저/방 목록이 포함돼 있으므로
+    # 여기서 다시 보내면 목록이 중복으로 쌓여 클라이언트가 꼬인다.
+    # 방 나가기 후(body 짧음)에만 유저/방 목록을 내려준다.
     if packet_type == 0x07FF:
         user = get_client_user(conn)
         print(f"[ACCOUNT INFO] user={user}")
-        remove_stale_rooms()
-        with lock:
-            room_snapshot_07 = [dict(room) for room in rooms]
-        active_users_07 = get_active_users()
-        return (
-            [make_packet(0x07FF, b"\x00\x00")]
-            + make_channel_user_list_packets(active_users_07)
-            + make_room_list_packets(room_snapshot_07)
-        )
+
+        if len(body) <= 1:
+            remove_stale_rooms()
+            with lock:
+                room_snapshot_07 = [dict(room) for room in rooms]
+            active_users_07 = get_active_users()
+            return (
+                [make_packet(0x07FF, b"\x00\x00")]
+                + make_channel_user_list_packets(active_users_07)
+                + make_room_list_packets(room_snapshot_07)
+            )
+
+        return [make_packet(0x07FF, b"\x00\x00")]
 
     # 방 목록 요청
     # 현재 방목록 항목 구조가 확인되지 않았으므로 빈 목록만 응답
