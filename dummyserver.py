@@ -342,12 +342,11 @@ def broadcast_room_list_to_lobby(except_conn=None):
         return
 
     active_users = get_active_users()
-    # 0x0BFF (채널 조인 알림)를 먼저 보내 클라이언트의 방 목록 수신 대기를
-    # 트리거한다. test1 계열 클라이언트가 0x0BFF를 받아야 push된 방 목록을
-    # 처리하는 것으로 보인다.
+    # 0x0BFF(채널 조인 알림)를 여기서 보내면 안 된다. 로비에 이미 있는
+    # 클라이언트가 0x0BFF를 받으면 "채널을 조인중입니다" 다이얼로그에 빠져
+    # 게임이 멈춘다. 유저/방 목록 데이터만 push한다.
     combined = b"".join(
-        [make_packet(0x0BFF, b"\x00" + DEFAULT_CHANNEL_NAME)]
-        + make_channel_user_list_packets(active_users)
+        make_channel_user_list_packets(active_users)
         + make_room_list_packets(room_snapshot)
     )
 
@@ -812,9 +811,13 @@ def get_responses(conn, addr, packet_type, body):
         set_user_state(creator, "room", get_room_name(body))
 
         # 방이 생성됐음을 로비에 있는 다른 유저들에게 즉시 push한다.
-        # 방목록 버튼 클릭 시 서버 push를 기다리는 클라이언트(test1 등)가
-        # "방리스트 요청중" 다이얼로그에서 멈추지 않도록 한다.
-        broadcast_room_list_to_lobby(except_conn=conn)
+        # 동기 호출하면 대상 소켓 버퍼가 차있을 때 현재 핸들러까지 블로킹하므로
+        # 별도 스레드에서 보낸다.
+        threading.Thread(
+            target=broadcast_room_list_to_lobby,
+            args=(conn,),
+            daemon=True,
+        ).start()
 
         if reported_by_other:
             print(f"[ROOM CREATE SYNCED] reporter={session_user}, owner={creator}")
@@ -869,7 +872,13 @@ def get_responses(conn, addr, packet_type, body):
             print_state("ROOM_EXIT")
 
         # 방이 제거됐으므로 로비에 있는 다른 클라이언트에게 방 목록을 push한다.
-        broadcast_room_list_to_lobby(except_conn=conn)
+        # 동기 호출하면 대상 소켓이 블로킹될 때 현재 유저의 응답까지 멈추므로
+        # 별도 스레드에서 보낸다.
+        threading.Thread(
+            target=broadcast_room_list_to_lobby,
+            args=(conn,),
+            daemon=True,
+        ).start()
 
         # ack + 채널 재조인(0x09/0x0A/0x0B)만 보낸다.
         # inline으로 유저/방 목록까지 보내면 클라이언트가 채널 재조인 시퀀스 도중
@@ -913,7 +922,11 @@ def get_responses(conn, addr, packet_type, body):
         # 채널 재조인(0x09/0x0A/0x0B)을 함께 내려준다.
         # 유저/방 목록은 inline으로 보내지 않고, 채널 재조인 후 클라이언트가
         # 자연스럽게 0x0BFF를 보내면 그 응답으로 보낸다.
-        broadcast_room_list_to_lobby(except_conn=conn)
+        threading.Thread(
+            target=broadcast_room_list_to_lobby,
+            args=(conn,),
+            daemon=True,
+        ).start()
         return (
             [make_packet(0x24FF, b"\x00\x00")]
             + make_lobby_rejoin_packets()
