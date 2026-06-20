@@ -527,6 +527,46 @@ def add_or_replace_room(room):
         )
 
 
+def find_room_host_for_player(user_id):
+    """user_id가 참가자(creator가 아닌)로 있는 방의 호스트 conn/addr을 반환."""
+    with lock:
+        for room in rooms:
+            if user_id in room.get("players", []) and room["creator"] != user_id:
+                host_session = sessions.get(room["creator"])
+                if host_session and host_session.get("conn"):
+                    return (
+                        host_session["conn"],
+                        host_session.get("addr"),
+                        room["creator"],
+                    )
+    return None
+
+
+def notify_room_host_player_left(leaving_user):
+    """참가자가 방을 떠났을 때 호스트에게 업데이트된 유저/방 목록을 push한다."""
+    host_info = find_room_host_for_player(leaving_user)
+    if not host_info:
+        return
+    host_conn, host_addr, host_user = host_info
+
+    remove_stale_rooms()
+    with lock:
+        room_snapshot = [dict(room) for room in rooms]
+    active_users = get_active_users()
+    combined = b"".join(
+        make_channel_user_list_packets(active_users)
+        + make_room_list_packets(room_snapshot)
+    )
+    try:
+        host_conn.sendall(combined)
+        print(
+            f"[ROOM HOST NOTIFY] -> {host_addr} ({host_user}): "
+            f"player {leaving_user} left"
+        )
+    except OSError as e:
+        print(f"[ROOM HOST NOTIFY FAIL] {host_addr}: {e}")
+
+
 def leave_room_state(user_id):
     with lock:
         removed_rooms = 0
@@ -873,6 +913,13 @@ def get_responses(conn, addr, packet_type, body):
         user = get_client_user(conn)
         print(f"[ROOM EXIT / CHANNEL REJOIN] user={user}")
         if user != "unknown":
+            # 참가자가 나가면 호스트에게 알린다(호스트 알림은 방 제거 전에
+            # 호스트를 찾아야 하므로 remove보다 먼저 호출).
+            threading.Thread(
+                target=notify_room_host_player_left,
+                args=(user,),
+                daemon=True,
+            ).start()
             remove_user_from_rooms(user)
             set_user_state(user, "lobby", None)
             print_state("ROOM_EXIT")
@@ -959,6 +1006,16 @@ def cleanup_disconnect(conn, addr, port):
 
     if port != 6112:
         return
+
+    # 방에 참가자로 있었으면 호스트에게 알림 (세션/clients 제거 전에 해야
+    # 호스트를 찾을 수 있다).
+    if disconnected_user != "unknown":
+        threading.Thread(
+            target=notify_room_host_player_left,
+            args=(disconnected_user,),
+            daemon=True,
+        ).start()
+        leave_room_state(disconnected_user)
 
     with lock:
         for client in list(clients):
