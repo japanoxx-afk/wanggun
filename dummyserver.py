@@ -341,14 +341,9 @@ def broadcast_room_list_to_lobby(except_conn=None):
     if not targets:
         return
 
-    active_users = get_active_users()
-    # 0x0BFF(채널 조인 알림)를 여기서 보내면 안 된다. 로비에 이미 있는
-    # 클라이언트가 0x0BFF를 받으면 "채널을 조인중입니다" 다이얼로그에 빠져
-    # 게임이 멈춘다. 유저/방 목록 데이터만 push한다.
-    combined = b"".join(
-        make_channel_user_list_packets(active_users)
-        + make_room_list_packets(room_snapshot)
-    )
+    # 방 목록 데이터만 push한다. 유저 목록(0x1FFF)을 보내면 클라이언트가
+    # 기존 목록에 APPEND해서 유저 리스트가 무한히 쌓인다.
+    combined = b"".join(make_room_list_packets(room_snapshot))
 
     for conn, addr, user_id in targets:
         try:
@@ -552,11 +547,7 @@ def notify_room_host_player_left(leaving_user):
     remove_stale_rooms()
     with lock:
         room_snapshot = [dict(room) for room in rooms]
-    active_users = get_active_users()
-    combined = b"".join(
-        make_channel_user_list_packets(active_users)
-        + make_room_list_packets(room_snapshot)
-    )
+    combined = b"".join(make_room_list_packets(room_snapshot))
     try:
         host_conn.sendall(combined)
         print(
@@ -699,6 +690,19 @@ def get_responses(conn, addr, packet_type, body):
         if len(parts) >= 2:
             user_id = parts[0]
             password = parts[1]
+
+            # IPX 릴레이 방지: 0x02FF에서 등록된 conn 유저(big)와 로그인
+            # user_id(user_a)가 다르면, 다른 PC가 릴레이한 로그인이다.
+            # 이 경우 세션을 만들면 안 된다(세션 conn이 릴레이어의 소켓을
+            # 가리켜 실제 유저의 연결이 깨진다). ACK만 보내고 무시한다.
+            conn_user = get_client_user(conn)
+            if conn_user not in ("unknown", user_id):
+                print(
+                    f"[LOGIN RELAY IGNORED] conn_user={conn_user}, "
+                    f"login_user={user_id}"
+                )
+                return [make_packet(0x05FF, b"\x00\x00")]
+
             old_conn = None
 
             with lock:
@@ -774,7 +778,6 @@ def get_responses(conn, addr, packet_type, body):
         return [make_packet(0x07FF, b"\x00\x00")]
 
     # 방 목록 요청
-    # 현재 방목록 항목 구조가 확인되지 않았으므로 빈 목록만 응답
     if packet_type == 0x0BFF:
         user = get_client_user(conn)
         remove_stale_rooms()
@@ -783,10 +786,6 @@ def get_responses(conn, addr, packet_type, body):
             room_snapshot = [dict(room) for room in rooms]
 
         print(f"[ROOM LIST REQUEST] user={user}, rooms={len(room_snapshot)}")
-        # 방 안에 있는 유저도 채널 유저 목록에 표시한다. 일부 클라이언트가
-        # 유저 목록에 없는 유저가 만든 방 항목을 처리하지 못하기 때문이다.
-        active_users = get_active_users()
-        print(f"[ROOM LIST USERS] users={[item['user_id'] for item in active_users]}")
 
         for room in room_snapshot:
             print(
@@ -796,7 +795,10 @@ def get_responses(conn, addr, packet_type, body):
                 f"body={decode_text(room['body'])}"
             )
 
-        return make_channel_user_list_packets(active_users) + make_room_list_packets(room_snapshot)
+        # 유저 목록(0x1FFF)을 여기서 보내면 안 된다. 클라이언트는 0x1FFF를
+        # 받을 때마다 기존 목록에 APPEND해서 유저 리스트가 무한히 쌓인다.
+        # 유저 목록은 로그인(0x05FF)·방 나가기(0x07FF post-exit)에서만 보낸다.
+        return make_room_list_packets(room_snapshot)
 
     if packet_type == 0x1FFF:
         user = get_client_user(conn)
