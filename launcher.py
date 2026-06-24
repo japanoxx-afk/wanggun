@@ -1,8 +1,14 @@
-"""태조왕건 서버 런처 — 서버 관리 + 호스트 파일 조작 GUI."""
+"""태조왕건 서버 런처 — 서버 관리 + 호스트 파일 조작 GUI.
+
+배포: PyInstaller로 단일 exe 빌드.
+  - 클라 유저: 런처.exe 하나만 있으면 동작 (호스트 파일 관리)
+  - 서버 호스트: 런처.exe + dummyserver.py를 같은 폴더에 둔다
+"""
 
 import ctypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -15,8 +21,12 @@ DOMAINS = [
 ]
 DEFAULT_IP = "26.157.67.215"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BAT_PATH = os.path.join(BASE_DIR, "서버시작.bat")
+
+
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def is_admin():
@@ -27,24 +37,69 @@ def is_admin():
 
 
 def run_as_admin():
-    if not is_admin():
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas",
-            sys.executable, f'"{os.path.abspath(__file__)}"',
-            None, 1,
-        )
-        sys.exit()
+    if is_admin():
+        return
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        args = ""
+    else:
+        exe = sys.executable
+        args = f'"{os.path.abspath(__file__)}"'
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+    sys.exit()
+
+
+def find_python():
+    for candidate in [
+        shutil.which("python"),
+        shutil.which("python3"),
+        r"C:\Users\seo\AppData\Local\Programs\Python\Python314\python.exe",
+        r"C:\Python314\python.exe",
+        r"C:\Python313\python.exe",
+        r"C:\Python312\python.exe",
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 class ServerManager:
-    def __init__(self):
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
         self.proc = None
+        self.server_script = os.path.join(base_dir, "dummyserver.py")
+        self.bat_file = os.path.join(base_dir, "서버시작.bat")
+
+    @property
+    def has_server(self):
+        return os.path.isfile(self.server_script)
 
     def start(self):
         if self.proc and self.proc.poll() is None:
             return False, "서버가 이미 실행 중입니다."
+
+        if os.path.isfile(self.bat_file):
+            self.proc = subprocess.Popen(
+                ["cmd", "/c", self.bat_file],
+                cwd=self.base_dir,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            return True, "서버를 시작했습니다."
+
+        python = find_python()
+        if not python:
+            return False, (
+                "Python이 설치되어 있지 않습니다.\n"
+                "서버 실행에는 Python이 필요합니다."
+            )
+        if not self.has_server:
+            return False, (
+                "dummyserver.py를 찾을 수 없습니다.\n"
+                f"런처와 같은 폴더에 넣어주세요.\n({self.base_dir})"
+            )
         self.proc = subprocess.Popen(
-            ["cmd", "/c", BAT_PATH],
+            [python, self.server_script],
+            cwd=self.base_dir,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
         return True, "서버를 시작했습니다."
@@ -111,10 +166,11 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("태조왕건 서버 런처")
-        self.geometry("420x320")
+        self.geometry("440x340")
         self.resizable(False, False)
 
-        self.server = ServerManager()
+        base = get_base_dir()
+        self.server = ServerManager(base)
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -124,7 +180,6 @@ class App(tk.Tk):
 
         self._update_status()
 
-    # ── 서버 탭 ──────────────────────────────────────────
     def _build_server_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  호스트 (서버)  ")
@@ -158,9 +213,17 @@ class App(tk.Tk):
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=16)
 
-        ttk.Label(frame, text=f"배치 파일: {BAT_PATH}", wraplength=380).pack(
-            anchor="w"
-        )
+        if self.server.has_server:
+            ttk.Label(frame, text="dummyserver.py 감지됨", foreground="green").pack(
+                anchor="w"
+            )
+        else:
+            ttk.Label(
+                frame,
+                text="※ 서버 기능을 사용하려면 dummyserver.py를\n"
+                "   이 런처와 같은 폴더에 넣어주세요.",
+                foreground="gray",
+            ).pack(anchor="w")
 
     def _on_start(self):
         ok, msg = self.server.start()
@@ -189,7 +252,6 @@ class App(tk.Tk):
             self.btn_start.state(["!disabled"])
         self.after(2000, self._update_status)
 
-    # ── 클라이언트 탭 ────────────────────────────────────
     def _build_client_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  클라 (접속)  ")
