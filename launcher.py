@@ -333,11 +333,18 @@ class App(tk.Tk):
         self.winmode = WindowModeManager(game_dir)
 
         notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._build_server_tab(notebook)
         self._build_client_tab(notebook)
         self._build_settings_tab(notebook)
+
+        launch_frame = ttk.Frame(self)
+        launch_frame.pack(fill="x", padx=8, pady=(0, 10))
+        ttk.Button(
+            launch_frame, text="게임 실행 (WangGun.exe)",
+            command=self._on_launch_game,
+        ).pack(anchor="center")
 
         self._update_status()
 
@@ -524,10 +531,6 @@ class App(tk.Tk):
 
         ttk.Button(
             bottom_frame, text="호스트 파일 열기", command=self._on_open_hosts
-        ).pack(side="left", padx=(0, 8))
-
-        ttk.Button(
-            bottom_frame, text="게임 실행", command=self._on_launch_game, width=12
         ).pack(side="left")
 
     def _sync_domains(self):
