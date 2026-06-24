@@ -15,12 +15,15 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+APP_VERSION = "0.1"
+
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
     "king.e2soft.com",
     "king.trigger.co.kr",
 ]
 DEFAULT_IP = "26.157.67.215"
+SERVER_LOOPBACK = "127.0.0.1"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 CONFIG_FILE = "launcher_config.json"
 
@@ -130,13 +133,18 @@ class ServerManager:
         if self.proc and self.proc.poll() is None:
             return False, "서버가 이미 실행 중입니다."
 
+        try:
+            HostsManager.apply_ip(SERVER_LOOPBACK, DEFAULT_DOMAINS)
+        except OSError:
+            pass
+
         if getattr(sys, "frozen", False):
             self.proc = subprocess.Popen(
                 [sys.executable, "--server"],
                 cwd=self.base_dir,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
-            return True, "서버를 시작했습니다."
+            return True, "서버를 시작했습니다. (hosts → 127.0.0.1)"
 
         bat = os.path.join(self.base_dir, "서버시작.bat")
         if os.path.isfile(bat):
@@ -222,7 +230,7 @@ class HostsManager:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("태조왕건 서버 런처")
+        self.title(f"태조왕건 서버 런처 v{APP_VERSION}")
         self.geometry("520x520")
         self.resizable(True, True)
         self.minsize(460, 460)
