@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -26,7 +26,9 @@ DEFAULT_IP = "26.157.67.215"
 SERVER_LOOPBACK = "127.0.0.1"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 CONFIG_FILE = "launcher_config.json"
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/japanoxx-afk/wanggun/main/dummyserver.py"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/japanoxx-afk/wanggun/main/"
+GITHUB_RAW_URL = GITHUB_RAW_BASE + "dummyserver.py"
+VERSION_CHECK_URL = GITHUB_RAW_BASE + "version.json"
 DEFAULT_GAME_DIR = r"C:\Program Files\태조왕건"
 DDRAW_INI = "ddraw.ini"
 RESOLUTIONS = [
@@ -100,6 +102,59 @@ def save_config(base_dir, cfg):
     path = os.path.join(base_dir, CONFIG_FILE)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+# ═══════════════════════════════════════════════════════
+#  자동 업데이트
+# ═══════════════════════════════════════════════════════
+
+def check_for_update():
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(VERSION_CHECK_URL)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        latest = data.get("launcher_version", APP_VERSION)
+        url = data.get("launcher_url", "")
+        if latest > APP_VERSION:
+            return latest, url
+    except Exception:
+        pass
+    return None, None
+
+
+def do_self_update(download_url):
+    import urllib.request
+    if not getattr(sys, "frozen", False):
+        return False, "개발 모드에서는 자동 업데이트를 사용할 수 없습니다."
+
+    current_exe = sys.executable
+    new_exe = current_exe + ".new"
+
+    try:
+        urllib.request.urlretrieve(download_url, new_exe)
+    except Exception as e:
+        return False, f"다운로드 실패:\n{e}"
+
+    bat_path = current_exe + ".update.bat"
+    bat_content = (
+        '@echo off\r\n'
+        'echo 업데이트 중...\r\n'
+        'timeout /t 2 /nobreak >nul\r\n'
+        f'del "{current_exe}"\r\n'
+        f'move "{new_exe}" "{current_exe}"\r\n'
+        f'start "" "{current_exe}"\r\n'
+        f'del "%~f0"\r\n'
+    )
+    with open(bat_path, "w", encoding="mbcs") as f:
+        f.write(bat_content)
+
+    subprocess.Popen(
+        ["cmd", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return True, ""
 
 
 # ═══════════════════════════════════════════════════════
@@ -755,5 +810,39 @@ if __name__ == "__main__":
         run_server_mode()
     else:
         run_as_admin()
+
+        latest, url = check_for_update()
+        if latest and url:
+            import tkinter as _tk
+            _root = _tk.Tk()
+            _root.withdraw()
+            do_update = messagebox.askyesno(
+                "업데이트 알림",
+                f"새 버전이 있습니다!\n\n"
+                f"현재: v{APP_VERSION}  →  최신: v{latest}\n\n"
+                f"지금 업데이트하시겠습니까?",
+            )
+            _root.destroy()
+            if do_update:
+                ok, err = do_self_update(url)
+                if ok:
+                    sys.exit()
+                else:
+                    _root2 = _tk.Tk()
+                    _root2.withdraw()
+                    messagebox.showerror("업데이트 실패", err)
+                    _root2.destroy()
+        elif latest and not url:
+            import tkinter as _tk
+            _root = _tk.Tk()
+            _root.withdraw()
+            messagebox.showinfo(
+                "업데이트 알림",
+                f"새 버전 v{latest}이 있습니다.\n"
+                f"GitHub에서 다운로드해 주세요.\n\n"
+                f"https://github.com/japanoxx-afk/wanggun/releases",
+            )
+            _root.destroy()
+
         app = App()
         app.mainloop()
