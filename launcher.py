@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -26,6 +26,9 @@ DEFAULT_IP = "26.157.67.215"
 SERVER_LOOPBACK = "127.0.0.1"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 CONFIG_FILE = "launcher_config.json"
+DEFAULT_GAME_DIR = r"C:\Program Files\태조왕건"
+DDRAW_INI = "ddraw.ini"
+RESOLUTIONS = ["640x480", "800x600", "1024x768", "1280x960", "1280x720", "1920x1080"]
 
 
 def get_base_dir():
@@ -227,6 +230,70 @@ class HostsManager:
         subprocess.Popen(["notepad.exe", HOSTS_PATH])
 
 
+class WindowModeManager:
+    def __init__(self, game_dir):
+        self.game_dir = game_dir
+
+    @property
+    def ini_path(self):
+        return os.path.join(self.game_dir, DDRAW_INI)
+
+    @property
+    def available(self):
+        return os.path.isfile(self.ini_path)
+
+    def read_settings(self):
+        result = {"windowed": False, "width": 800, "height": 600}
+        if not self.available:
+            return result
+        try:
+            with open(self.ini_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(";") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key, val = key.strip(), val.strip()
+                    if key == "windowed":
+                        result["windowed"] = val.lower() == "true"
+                    elif key == "width" and val.isdigit():
+                        result["width"] = int(val)
+                    elif key == "height" and val.isdigit():
+                        result["height"] = int(val)
+        except OSError:
+            pass
+        return result
+
+    def apply_settings(self, windowed, width, height):
+        if not self.available:
+            return False, f"ddraw.ini를 찾을 수 없습니다.\n({self.ini_path})"
+        try:
+            with open(self.ini_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError as e:
+            return False, str(e)
+
+        def set_value(text, key, value):
+            pattern = re.compile(rf"^(\s*){re.escape(key)}\s*=.*$", re.MULTILINE)
+            if pattern.search(text):
+                return pattern.sub(rf"\g<1>{key}={value}", text)
+            return text
+
+        content = set_value(content, "windowed", "true" if windowed else "false")
+        content = set_value(content, "fullscreen", "false" if windowed else "true")
+        content = set_value(content, "width", str(width))
+        content = set_value(content, "height", str(height))
+
+        try:
+            with open(self.ini_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            return False, str(e)
+
+        mode = "창모드" if windowed else "전체화면"
+        return True, f"{mode} ({width}x{height}) 적용 완료."
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -240,11 +307,15 @@ class App(tk.Tk):
         self.cfg = load_config(self.base_dir)
         self.domains = list(self.cfg.get("domains", DEFAULT_DOMAINS))
 
+        game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        self.winmode = WindowModeManager(game_dir)
+
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         self._build_server_tab(notebook)
         self._build_client_tab(notebook)
+        self._build_settings_tab(notebook)
 
         self._update_status()
 
@@ -460,6 +531,95 @@ class App(tk.Tk):
 
     def _on_open_hosts(self):
         HostsManager.open_hosts_file()
+
+    # ── 설정 탭 ──────────────────────────────────────────
+    def _build_settings_tab(self, notebook):
+        frame = ttk.Frame(notebook, padding=16)
+        notebook.add(frame, text="  설정  ")
+
+        ttk.Label(frame, text="게임 창모드 설정", font=("맑은 고딕", 12, "bold")).pack(
+            anchor="w", pady=(0, 12)
+        )
+
+        # ── 게임 경로 ──
+        path_frame = ttk.LabelFrame(frame, text="게임 설치 경로", padding=10)
+        path_frame.pack(fill="x", pady=(0, 10))
+
+        self.gamedir_var = tk.StringVar(value=self.winmode.game_dir)
+        ttk.Entry(path_frame, textvariable=self.gamedir_var, width=48).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(
+            path_frame, text="찾기", command=self._on_browse_game, width=6
+        ).pack(side="left")
+
+        # ── 창모드 ──
+        mode_frame = ttk.LabelFrame(frame, text="디스플레이 모드", padding=12)
+        mode_frame.pack(fill="x", pady=(0, 10))
+
+        settings = self.winmode.read_settings()
+
+        self.windowed_var = tk.BooleanVar(value=settings["windowed"])
+        ttk.Checkbutton(
+            mode_frame, text="창모드로 실행 (Alt+Enter로 토글 가능)",
+            variable=self.windowed_var,
+        ).pack(anchor="w", pady=(0, 10))
+
+        res_row = ttk.Frame(mode_frame)
+        res_row.pack(fill="x")
+
+        ttk.Label(res_row, text="해상도:").pack(side="left")
+        current_res = f"{settings['width']}x{settings['height']}"
+        self.res_var = tk.StringVar(value=current_res)
+        res_combo = ttk.Combobox(
+            res_row, textvariable=self.res_var, values=RESOLUTIONS, width=14
+        )
+        res_combo.pack(side="left", padx=(6, 0))
+
+        # ── 적용 ──
+        ttk.Button(
+            frame, text="설정 적용", command=self._on_apply_winmode, width=14
+        ).pack(anchor="w", pady=(4, 0))
+
+        if not self.winmode.available:
+            ttk.Label(
+                frame,
+                text="※ ddraw.ini를 찾을 수 없습니다. 게임 경로를 확인하세요.",
+                foreground="red",
+            ).pack(anchor="w", pady=(8, 0))
+
+    def _on_browse_game(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(
+            title="태조왕건 설치 폴더 선택",
+            initialdir=self.gamedir_var.get(),
+        )
+        if d:
+            self.gamedir_var.set(d)
+            self.winmode.game_dir = d
+            self.cfg["game_dir"] = d
+            save_config(self.base_dir, self.cfg)
+
+    def _on_apply_winmode(self):
+        game_dir = self.gamedir_var.get().strip()
+        if game_dir != self.winmode.game_dir:
+            self.winmode.game_dir = game_dir
+            self.cfg["game_dir"] = game_dir
+            save_config(self.base_dir, self.cfg)
+
+        res = self.res_var.get().strip()
+        try:
+            w, h = res.split("x")
+            width, height = int(w), int(h)
+        except (ValueError, AttributeError):
+            messagebox.showwarning("입력 오류", "해상도 형식: 800x600")
+            return
+
+        ok, msg = self.winmode.apply_settings(self.windowed_var.get(), width, height)
+        if ok:
+            messagebox.showinfo("설정", msg)
+        else:
+            messagebox.showerror("오류", msg)
 
 
 # ═══════════════════════════════════════════════════════
