@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -33,6 +33,15 @@ RESOLUTIONS = [
     "640x480", "800x600", "1024x768", "1280x720", "1280x960",
     "1600x900", "1920x1080", "2560x1440", "3440x1440", "3840x2160",
 ]
+SHADERS = [
+    ("선명하게 (Lanczos)", "Lanczos"),
+    ("부드럽게 (Bicubic)", "Bicubic"),
+    ("기본 (Bilinear)", "Bilinear"),
+    ("픽셀아트 보간 (xBR-lv2)", "xBR-lv2"),
+    ("도트 그대로 (Nearest)", "Nearest neighbor"),
+    ("catmull-rom (기본값)", "Shaders\\interpolation\\catmull-rom-bilinear.glsl"),
+]
+SHADER_VALUES = {label: val for label, val in SHADERS}
 
 
 def get_base_dir():
@@ -248,7 +257,8 @@ class WindowModeManager:
         return os.path.isfile(self.ini_path)
 
     def read_settings(self):
-        result = {"windowed": False, "width": 800, "height": 600}
+        result = {"windowed": False, "width": 800, "height": 600,
+                  "shader": "", "maintas": False}
         if not self.available:
             return result
         try:
@@ -265,11 +275,15 @@ class WindowModeManager:
                         result["width"] = int(val)
                     elif key == "height" and val.isdigit():
                         result["height"] = int(val)
+                    elif key == "shader":
+                        result["shader"] = val
+                    elif key == "maintas":
+                        result["maintas"] = val.lower() == "true"
         except OSError:
             pass
         return result
 
-    def apply_settings(self, windowed, width, height):
+    def apply_settings(self, windowed, width, height, shader="", maintas=False):
         if not self.available:
             return False, f"ddraw.ini를 찾을 수 없습니다.\n({self.ini_path})"
         try:
@@ -288,6 +302,9 @@ class WindowModeManager:
         content = set_value(content, "fullscreen", "false" if windowed else "true")
         content = set_value(content, "width", str(width))
         content = set_value(content, "height", str(height))
+        content = set_value(content, "maintas", "true" if maintas else "false")
+        if shader:
+            content = set_value(content, "shader", shader)
 
         try:
             with open(self.ini_path, "w", encoding="utf-8") as f:
@@ -303,9 +320,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"태조왕건 서버 런처 v{APP_VERSION}")
-        self.geometry("520x520")
+        self.geometry("520x580")
         self.resizable(True, True)
-        self.minsize(460, 460)
+        self.minsize(460, 520)
 
         self.base_dir = get_base_dir()
         self.server = ServerManager(self.base_dir)
@@ -611,10 +628,16 @@ class App(tk.Tk):
         ttk.Checkbutton(
             mode_frame, text="창모드로 실행 (Alt+Enter로 토글 가능)",
             variable=self.windowed_var,
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.maintas_var = tk.BooleanVar(value=settings.get("maintas", False))
+        ttk.Checkbutton(
+            mode_frame, text="비율 유지 (4:3 비율 고정)",
+            variable=self.maintas_var,
         ).pack(anchor="w", pady=(0, 10))
 
         res_row = ttk.Frame(mode_frame)
-        res_row.pack(fill="x")
+        res_row.pack(fill="x", pady=(0, 4))
 
         ttk.Label(res_row, text="해상도:").pack(side="left")
         current_res = f"{settings['width']}x{settings['height']}"
@@ -623,6 +646,32 @@ class App(tk.Tk):
             res_row, textvariable=self.res_var, values=RESOLUTIONS, width=14
         )
         res_combo.pack(side="left", padx=(6, 0))
+
+        # ── 업스케일 셰이더 ──
+        shader_frame = ttk.LabelFrame(frame, text="업스케일 셰이더 (고해상도 화질 개선)", padding=12)
+        shader_frame.pack(fill="x", pady=(0, 10))
+
+        current_shader = settings.get("shader", "")
+        shader_label = current_shader
+        for label, val in SHADERS:
+            if val == current_shader:
+                shader_label = label
+                break
+
+        self.shader_var = tk.StringVar(value=shader_label)
+        shader_labels = [label for label, _ in SHADERS]
+        shader_combo = ttk.Combobox(
+            shader_frame, textvariable=self.shader_var,
+            values=shader_labels, width=30, state="readonly",
+        )
+        shader_combo.pack(anchor="w", pady=(0, 6))
+
+        ttk.Label(
+            shader_frame,
+            text="Lanczos = 가장 선명  |  xBR-lv2 = 도트를 곡선으로 보간\n"
+                 "게임 내부 800x600 → 설정 해상도로 업스케일합니다.",
+            foreground="gray",
+        ).pack(anchor="w")
 
         # ── 적용 ──
         ttk.Button(
@@ -663,7 +712,12 @@ class App(tk.Tk):
             messagebox.showwarning("입력 오류", "해상도 형식: 800x600")
             return
 
-        ok, msg = self.winmode.apply_settings(self.windowed_var.get(), width, height)
+        shader_label = self.shader_var.get()
+        shader_val = SHADER_VALUES.get(shader_label, shader_label)
+        ok, msg = self.winmode.apply_settings(
+            self.windowed_var.get(), width, height,
+            shader=shader_val, maintas=self.maintas_var.get(),
+        )
         if ok:
             messagebox.showinfo("설정", msg)
         else:
