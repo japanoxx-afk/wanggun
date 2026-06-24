@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -524,6 +524,10 @@ class App(tk.Tk):
 
         ttk.Button(
             bottom_frame, text="호스트 파일 열기", command=self._on_open_hosts
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            bottom_frame, text="게임 실행", command=self._on_launch_game, width=12
         ).pack(side="left")
 
     def _sync_domains(self):
@@ -596,6 +600,21 @@ class App(tk.Tk):
 
     def _on_open_hosts(self):
         HostsManager.open_hosts_file()
+
+    def _on_launch_game(self):
+        game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        exe = os.path.join(game_dir, "WangGun.exe")
+        if not os.path.isfile(exe):
+            messagebox.showerror(
+                "오류",
+                f"WangGun.exe를 찾을 수 없습니다.\n({exe})\n\n"
+                "설정 탭에서 게임 경로를 확인하세요.",
+            )
+            return
+        try:
+            subprocess.Popen([exe], cwd=game_dir)
+        except OSError as e:
+            messagebox.showerror("실행 오류", str(e))
 
     # ── 설정 탭 ──────────────────────────────────────────
     def _build_settings_tab(self, notebook):
