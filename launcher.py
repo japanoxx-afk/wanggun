@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -28,7 +28,10 @@ HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 CONFIG_FILE = "launcher_config.json"
 DEFAULT_GAME_DIR = r"C:\Program Files\태조왕건"
 DDRAW_INI = "ddraw.ini"
-RESOLUTIONS = ["640x480", "800x600", "1024x768", "1280x960", "1280x720", "1920x1080"]
+RESOLUTIONS = [
+    "640x480", "800x600", "1024x768", "1280x720", "1280x960",
+    "1600x900", "1920x1080", "2560x1440", "3440x1440", "3840x2160",
+]
 
 
 def get_base_dir():
