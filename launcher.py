@@ -1,8 +1,8 @@
 """태조왕건 서버 런처 — 서버 관리 + 호스트 파일 조작 GUI.
 
-배포: PyInstaller로 단일 exe 빌드.
-  - 클라 유저: 런처.exe 하나만 있으면 동작 (호스트 파일 관리)
-  - 서버 호스트: 런처.exe + dummyserver.py를 같은 폴더에 둔다
+단일 exe로 빌드하면 dummyserver.py가 내장된다.
+  - 더블클릭: GUI 런처
+  - 내부적으로 "서버 시작" 클릭 시 같은 exe를 --server 모드로 재실행
 """
 
 import ctypes
@@ -31,6 +31,12 @@ def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_resource_dir():
+    if getattr(sys, "frozen", False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -56,9 +62,6 @@ def find_python():
         shutil.which("python"),
         shutil.which("python3"),
         r"C:\Users\seo\AppData\Local\Programs\Python\Python314\python.exe",
-        r"C:\Python314\python.exe",
-        r"C:\Python313\python.exe",
-        r"C:\Python312\python.exe",
     ]:
         if candidate and os.path.isfile(candidate):
             return candidate
@@ -80,42 +83,78 @@ def save_config(base_dir, cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+# ═══════════════════════════════════════════════════════
+#  서버 모드 (--server)
+# ═══════════════════════════════════════════════════════
+
+def run_server_mode():
+    kernel32 = ctypes.windll.kernel32
+    kernel32.AllocConsole()
+    kernel32.SetConsoleTitleW("태조왕건 더미 서버")
+
+    sys.stdout = open("CONOUT$", "w", encoding="utf-8")
+    sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+    sys.stdin = open("CONIN$", "r", encoding="utf-8")
+
+    base = get_base_dir()
+    os.chdir(base)
+
+    script = os.path.join(get_resource_dir(), "dummyserver.py")
+    if not os.path.isfile(script):
+        script = os.path.join(base, "dummyserver.py")
+
+    if not os.path.isfile(script):
+        print("오류: dummyserver.py를 찾을 수 없습니다.")
+        input("Enter를 눌러 종료...")
+        return
+
+    with open(script, "r", encoding="utf-8") as f:
+        code = f.read()
+
+    exec(compile(code, script, "exec"), {
+        "__name__": "__main__",
+        "__file__": os.path.join(base, "dummyserver.py"),
+    })
+
+
+# ═══════════════════════════════════════════════════════
+#  GUI 모드
+# ═══════════════════════════════════════════════════════
+
 class ServerManager:
     def __init__(self, base_dir):
         self.base_dir = base_dir
         self.proc = None
-        self.server_script = os.path.join(base_dir, "dummyserver.py")
-        self.bat_file = os.path.join(base_dir, "서버시작.bat")
-
-    @property
-    def has_server(self):
-        return os.path.isfile(self.server_script)
 
     def start(self):
         if self.proc and self.proc.poll() is None:
             return False, "서버가 이미 실행 중입니다."
 
-        if os.path.isfile(self.bat_file):
+        if getattr(sys, "frozen", False):
             self.proc = subprocess.Popen(
-                ["cmd", "/c", self.bat_file],
+                [sys.executable, "--server"],
+                cwd=self.base_dir,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            return True, "서버를 시작했습니다."
+
+        bat = os.path.join(self.base_dir, "서버시작.bat")
+        if os.path.isfile(bat):
+            self.proc = subprocess.Popen(
+                ["cmd", "/c", bat],
                 cwd=self.base_dir,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
             return True, "서버를 시작했습니다."
 
         python = find_python()
+        script = os.path.join(self.base_dir, "dummyserver.py")
         if not python:
-            return False, (
-                "Python이 설치되어 있지 않습니다.\n"
-                "서버 실행에는 Python이 필요합니다."
-            )
-        if not self.has_server:
-            return False, (
-                "dummyserver.py를 찾을 수 없습니다.\n"
-                f"런처와 같은 폴더에 넣어주세요.\n({self.base_dir})"
-            )
+            return False, "Python이 설치되어 있지 않습니다."
+        if not os.path.isfile(script):
+            return False, "dummyserver.py를 찾을 수 없습니다."
         self.proc = subprocess.Popen(
-            [python, self.server_script],
+            [python, script],
             cwd=self.base_dir,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
@@ -201,7 +240,6 @@ class App(tk.Tk):
 
         self._update_status()
 
-    # ── 서버 탭 ──────────────────────────────────────────
     def _build_server_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  호스트 (서버)  ")
@@ -235,17 +273,22 @@ class App(tk.Tk):
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=16)
 
-        if self.server.has_server:
-            ttk.Label(frame, text="dummyserver.py 감지됨", foreground="green").pack(
+        if getattr(sys, "frozen", False):
+            ttk.Label(frame, text="서버 내장 모드 (단일 exe)", foreground="green").pack(
                 anchor="w"
             )
         else:
-            ttk.Label(
-                frame,
-                text="※ 서버 기능을 사용하려면 dummyserver.py를\n"
-                "   이 런처와 같은 폴더에 넣어주세요.",
-                foreground="gray",
-            ).pack(anchor="w")
+            script = os.path.join(self.base_dir, "dummyserver.py")
+            if os.path.isfile(script):
+                ttk.Label(frame, text="dummyserver.py 감지됨", foreground="green").pack(
+                    anchor="w"
+                )
+            else:
+                ttk.Label(
+                    frame,
+                    text="※ dummyserver.py를 같은 폴더에 넣어주세요.",
+                    foreground="gray",
+                ).pack(anchor="w")
 
     def _on_start(self):
         ok, msg = self.server.start()
@@ -274,7 +317,6 @@ class App(tk.Tk):
             self.btn_start.state(["!disabled"])
         self.after(2000, self._update_status)
 
-    # ── 클라이언트 탭 ────────────────────────────────────
     def _build_client_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  클라 (접속)  ")
@@ -283,7 +325,6 @@ class App(tk.Tk):
             anchor="w", pady=(0, 8)
         )
 
-        # ── IP 입력 ──
         ip_frame = ttk.LabelFrame(frame, text="서버 호스트 변경", padding=10)
         ip_frame.pack(fill="x", pady=(0, 8))
 
@@ -300,7 +341,6 @@ class App(tk.Tk):
             side="left"
         )
 
-        # ── 도메인 목록 ──
         domain_frame = ttk.LabelFrame(frame, text="매핑 도메인 목록 (편집 가능)", padding=8)
         domain_frame.pack(fill="both", expand=True, pady=(0, 8))
 
@@ -335,7 +375,6 @@ class App(tk.Tk):
             domain_btn_frame, text="기본값 복원", command=self._on_reset_domains, width=12
         ).pack(side="left")
 
-        # ── 하단 버튼 ──
         bottom_frame = ttk.Frame(frame)
         bottom_frame.pack(fill="x")
 
@@ -415,7 +454,14 @@ class App(tk.Tk):
         HostsManager.open_hosts_file()
 
 
+# ═══════════════════════════════════════════════════════
+#  엔트리포인트
+# ═══════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    run_as_admin()
-    app = App()
-    app.mainloop()
+    if "--server" in sys.argv:
+        run_server_mode()
+    else:
+        run_as_admin()
+        app = App()
+        app.mainloop()
