@@ -6,6 +6,7 @@
 """
 
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -14,13 +15,14 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-DOMAINS = [
+DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
     "king.e2soft.com",
     "king.trigger.co.kr",
 ]
 DEFAULT_IP = "26.157.67.215"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+CONFIG_FILE = "launcher_config.json"
 
 
 def get_base_dir():
@@ -61,6 +63,21 @@ def find_python():
         if candidate and os.path.isfile(candidate):
             return candidate
     return None
+
+
+def load_config(base_dir):
+    path = os.path.join(base_dir, CONFIG_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(base_dir, cfg):
+    path = os.path.join(base_dir, CONFIG_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
 class ServerManager:
@@ -122,28 +139,29 @@ class ServerManager:
 
 class HostsManager:
     @staticmethod
-    def read_current_ip():
+    def read_current_ip(domains):
         try:
             with open(HOSTS_PATH, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line.startswith("#") or not line:
                         continue
-                    if DOMAINS[0] in line:
-                        return line.split()[0]
+                    for d in domains:
+                        if d in line:
+                            return line.split()[0]
         except OSError:
             pass
         return DEFAULT_IP
 
     @staticmethod
-    def apply_ip(ip):
+    def apply_ip(ip, domains):
         try:
             with open(HOSTS_PATH, "r", encoding="utf-8") as f:
                 content = f.read()
         except OSError:
             content = ""
 
-        for domain in DOMAINS:
+        for domain in domains:
             pattern = re.compile(
                 rf"^[^\S\n]*\S+\s+{re.escape(domain)}\s*$",
                 re.MULTILINE,
@@ -151,7 +169,7 @@ class HostsManager:
             content = pattern.sub("", content)
 
         content = content.rstrip("\n") + "\n"
-        for domain in DOMAINS:
+        for domain in domains:
             content += f"{ip} {domain}\n"
 
         with open(HOSTS_PATH, "w", encoding="utf-8") as f:
@@ -166,11 +184,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("태조왕건 서버 런처")
-        self.geometry("440x340")
-        self.resizable(False, False)
+        self.geometry("520x520")
+        self.resizable(True, True)
+        self.minsize(460, 460)
 
-        base = get_base_dir()
-        self.server = ServerManager(base)
+        self.base_dir = get_base_dir()
+        self.server = ServerManager(self.base_dir)
+        self.cfg = load_config(self.base_dir)
+        self.domains = list(self.cfg.get("domains", DEFAULT_DOMAINS))
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -180,6 +201,7 @@ class App(tk.Tk):
 
         self._update_status()
 
+    # ── 서버 탭 ──────────────────────────────────────────
     def _build_server_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  호스트 (서버)  ")
@@ -252,48 +274,133 @@ class App(tk.Tk):
             self.btn_start.state(["!disabled"])
         self.after(2000, self._update_status)
 
+    # ── 클라이언트 탭 ────────────────────────────────────
     def _build_client_tab(self, notebook):
         frame = ttk.Frame(notebook, padding=16)
         notebook.add(frame, text="  클라 (접속)  ")
 
         ttk.Label(frame, text="호스트 파일 관리", font=("맑은 고딕", 12, "bold")).pack(
-            anchor="w", pady=(0, 12)
+            anchor="w", pady=(0, 8)
         )
 
-        current_ip = HostsManager.read_current_ip()
+        # ── IP 입력 ──
+        ip_frame = ttk.LabelFrame(frame, text="서버 호스트 변경", padding=10)
+        ip_frame.pack(fill="x", pady=(0, 8))
 
-        ip_frame = ttk.LabelFrame(frame, text="서버 호스트 변경", padding=12)
-        ip_frame.pack(fill="x", pady=(0, 12))
+        ip_row = ttk.Frame(ip_frame)
+        ip_row.pack(fill="x")
 
-        ttk.Label(ip_frame, text="서버 IP 주소:").pack(anchor="w")
+        ttk.Label(ip_row, text="서버 IP:").pack(side="left")
+        current_ip = HostsManager.read_current_ip(self.domains)
         self.ip_var = tk.StringVar(value=current_ip)
-        ip_entry = ttk.Entry(ip_frame, textvariable=self.ip_var, width=28)
-        ip_entry.pack(anchor="w", pady=(4, 8))
+        ttk.Entry(ip_row, textvariable=self.ip_var, width=22).pack(
+            side="left", padx=(6, 8)
+        )
+        ttk.Button(ip_row, text="IP 적용", command=self._on_apply_ip, width=10).pack(
+            side="left"
+        )
+
+        # ── 도메인 목록 ──
+        domain_frame = ttk.LabelFrame(frame, text="매핑 도메인 목록 (편집 가능)", padding=8)
+        domain_frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        list_container = ttk.Frame(domain_frame)
+        list_container.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        self.domain_listbox = tk.Listbox(
+            list_container,
+            height=6,
+            font=("Consolas", 10),
+            yscrollcommand=scrollbar.set,
+        )
+        self.domain_listbox.pack(fill="both", expand=True)
+        scrollbar.config(command=self.domain_listbox.yview)
+
+        for d in self.domains:
+            self.domain_listbox.insert(tk.END, d)
+
+        domain_btn_frame = ttk.Frame(domain_frame)
+        domain_btn_frame.pack(fill="x", pady=(6, 0))
 
         ttk.Button(
-            ip_frame, text="IP 적용", command=self._on_apply_ip, width=14
-        ).pack(anchor="w")
+            domain_btn_frame, text="추가", command=self._on_add_domain, width=8
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            domain_btn_frame, text="삭제", command=self._on_remove_domain, width=8
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            domain_btn_frame, text="기본값 복원", command=self._on_reset_domains, width=12
+        ).pack(side="left")
 
-        domain_frame = ttk.LabelFrame(frame, text="매핑 도메인 목록", padding=8)
-        domain_frame.pack(fill="x", pady=(0, 12))
-        for d in DOMAINS:
-            ttk.Label(domain_frame, text=f"  • {d}").pack(anchor="w")
+        # ── 하단 버튼 ──
+        bottom_frame = ttk.Frame(frame)
+        bottom_frame.pack(fill="x")
 
         ttk.Button(
-            frame, text="호스트 파일 직접 편집 (메모장)", command=self._on_open_hosts
-        ).pack(anchor="w")
+            bottom_frame, text="호스트 파일 열기", command=self._on_open_hosts
+        ).pack(side="left")
+
+    def _sync_domains(self):
+        self.domains = list(self.domain_listbox.get(0, tk.END))
+        self.cfg["domains"] = self.domains
+        save_config(self.base_dir, self.cfg)
+
+    def _on_add_domain(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("도메인 추가")
+        dlg.geometry("340x100")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="도메인 주소:").pack(anchor="w", padx=12, pady=(12, 4))
+        var = tk.StringVar()
+        entry = ttk.Entry(dlg, textvariable=var, width=40)
+        entry.pack(padx=12)
+        entry.focus_set()
+
+        def confirm(event=None):
+            val = var.get().strip()
+            if val:
+                self.domain_listbox.insert(tk.END, val)
+                self._sync_domains()
+            dlg.destroy()
+
+        entry.bind("<Return>", confirm)
+        ttk.Button(dlg, text="추가", command=confirm).pack(pady=8)
+
+    def _on_remove_domain(self):
+        sel = self.domain_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("알림", "삭제할 도메인을 선택하세요.")
+            return
+        self.domain_listbox.delete(sel[0])
+        self._sync_domains()
+
+    def _on_reset_domains(self):
+        self.domain_listbox.delete(0, tk.END)
+        for d in DEFAULT_DOMAINS:
+            self.domain_listbox.insert(tk.END, d)
+        self._sync_domains()
 
     def _on_apply_ip(self):
         ip = self.ip_var.get().strip()
         if not ip:
             messagebox.showwarning("입력 오류", "IP 주소를 입력하세요.")
             return
+        self._sync_domains()
+        if not self.domains:
+            messagebox.showwarning("입력 오류", "도메인 목록이 비어 있습니다.")
+            return
         try:
-            HostsManager.apply_ip(ip)
+            HostsManager.apply_ip(ip, self.domains)
             messagebox.showinfo(
                 "완료",
-                f"호스트 파일이 업데이트되었습니다.\n\n"
-                + "\n".join(f"{ip}  {d}" for d in DOMAINS),
+                "호스트 파일이 업데이트되었습니다.\n\n"
+                + "\n".join(f"{ip}  {d}" for d in self.domains),
             )
         except PermissionError:
             messagebox.showerror(
