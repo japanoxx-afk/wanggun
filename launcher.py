@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -26,6 +26,7 @@ DEFAULT_IP = "26.157.67.215"
 SERVER_LOOPBACK = "127.0.0.1"
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 CONFIG_FILE = "launcher_config.json"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/japanoxx-afk/wanggun/main/dummyserver.py"
 DEFAULT_GAME_DIR = r"C:\Program Files\태조왕건"
 DDRAW_INI = "ddraw.ini"
 RESOLUTIONS = [
@@ -108,9 +109,10 @@ def run_server_mode():
     base = get_base_dir()
     os.chdir(base)
 
-    script = os.path.join(get_resource_dir(), "dummyserver.py")
+    # 업데이트된 로컬 파일을 우선, 없으면 exe 내장 버전 사용
+    script = os.path.join(base, "dummyserver.py")
     if not os.path.isfile(script):
-        script = os.path.join(base, "dummyserver.py")
+        script = os.path.join(get_resource_dir(), "dummyserver.py")
 
     if not os.path.isfile(script):
         print("오류: dummyserver.py를 찾을 수 없습니다.")
@@ -353,6 +355,18 @@ class App(tk.Tk):
         )
         self.btn_stop.pack(side="left")
 
+        update_frame = ttk.Frame(frame)
+        update_frame.pack(fill="x", pady=(12, 0))
+
+        ttk.Button(
+            update_frame, text="서버 업데이트 (GitHub)", command=self._on_update, width=24
+        ).pack(side="left")
+
+        self.update_status_var = tk.StringVar()
+        ttk.Label(update_frame, textvariable=self.update_status_var, foreground="gray").pack(
+            side="left", padx=(8, 0)
+        )
+
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=16)
 
         if getattr(sys, "frozen", False):
@@ -389,6 +403,37 @@ class App(tk.Tk):
         self._update_status()
         if not ok:
             messagebox.showwarning("서버", msg)
+
+    def _on_update(self):
+        import urllib.request
+        import urllib.error
+
+        self.update_status_var.set("다운로드 중...")
+        self.update()
+
+        dest = os.path.join(self.base_dir, "dummyserver.py")
+        try:
+            req = urllib.request.Request(GITHUB_RAW_URL)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read()
+
+            with open(dest, "wb") as f:
+                f.write(data)
+
+            size_kb = len(data) / 1024
+            self.update_status_var.set(f"완료 ({size_kb:.0f}KB)")
+            messagebox.showinfo(
+                "업데이트",
+                f"dummyserver.py를 최신 버전으로 업데이트했습니다.\n"
+                f"({size_kb:.0f}KB 다운로드)\n\n"
+                f"서버가 실행 중이면 재시작해야 적용됩니다.",
+            )
+        except urllib.error.URLError as e:
+            self.update_status_var.set("실패")
+            messagebox.showerror("업데이트 실패", f"다운로드 오류:\n{e}")
+        except OSError as e:
+            self.update_status_var.set("실패")
+            messagebox.showerror("업데이트 실패", f"파일 저장 오류:\n{e}")
 
     def _update_status(self):
         if self.server.running:
