@@ -30,6 +30,21 @@ clients = []
 lock = threading.RLock()
 log_lock = threading.RLock()
 
+# 패킷 타입 이름 매핑 (로그 가독성용)
+PACKET_NAMES = {
+    0x8001: "AUTH_PING",   0x8002: "AUTH_VER",    0x8003: "AUTH_NAME",
+    0x01FF: "VER_CHECK",   0x02FF: "GAME_VER",    0x03FF: "NEWS",
+    0x04FF: "NEW_ACCT",    0x05FF: "LOGIN",        0x07FF: "ACCT_INFO",
+    0x09FF: "CH_JOIN_1",   0x0AFF: "CH_JOIN_2",   0x0BFF: "ROOM_LIST",
+    0x0CFF: "RL_START",    0x0DFF: "RL_ITEM",     0x0EFF: "ROOM_CREATE",
+    0x10FF: "ROOM_JOIN",   0x11FF: "ROOM_EXIT",   0x12FF: "CHAT",
+    0x1FFF: "USER_LIST",   0x24FF: "GAME_REPORT",
+}
+
+# 연결별 ID 카운터
+_conn_counter = 0
+_conn_counter_lock = threading.Lock()
+
 
 class TeeOutput:
     def __init__(self, *streams):
@@ -69,7 +84,19 @@ def setup_logging():
 
 
 def now():
-    return datetime.datetime.now().strftime("%H:%M:%S")
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def alloc_conn_id():
+    global _conn_counter
+    with _conn_counter_lock:
+        _conn_counter += 1
+        return f"C{_conn_counter:03d}"
+
+
+def plabel(packet_type):
+    """패킷 타입을 읽기 쉬운 레이블로 반환: 0x05FF/LOGIN"""
+    return f"0x{packet_type:04X}/{PACKET_NAMES.get(packet_type, '?')}"
 
 
 def make_packet(packet_type, body=b""):
@@ -84,7 +111,7 @@ def parse_packets(buffer):
         packet_type, packet_size = struct.unpack_from("<HH", buffer, offset)
 
         if packet_size < 4 or packet_size > MAX_PACKET_SIZE:
-            print(f"[WARN] Invalid packet size: type=0x{packet_type:04X}, size={packet_size}")
+            print(f"[WARN] Invalid packet size: type={plabel(packet_type)}, size={packet_size}")
             break
 
         if len(buffer) - offset < packet_size:
@@ -156,15 +183,6 @@ def ensure_default_accounts():
         print("[ACCOUNTS DEFAULTS CREATED] user_a/user_b")
 
 
-def print_packet(port, addr, packet_type, packet_size, body):
-    print()
-    print(f"[{now()}] TCP:{port} from {addr}")
-    print(f"TYPE      : 0x{packet_type:04X}")
-    print(f"SIZE      : {packet_size}")
-    print(f"BODY HEX  : {body.hex(' ')}")
-    print(f"BODY TEXT : {decode_text(body)}")
-
-
 def get_client(conn):
     with lock:
         for client in clients:
@@ -184,6 +202,11 @@ def get_client_user(conn):
     if client and client.get("user_id"):
         return client["user_id"]
     return "unknown"
+
+
+def get_conn_id(conn):
+    client = get_client(conn)
+    return client.get("conn_id", "C???") if client else "C???"
 
 
 def close_socket_quietly(conn):
@@ -252,8 +275,11 @@ def set_user_state(user_id, state, room_name=None):
     with lock:
         session = sessions.get(user_id)
         if session:
+            old_state = session.get("state", "?")
             session["state"] = state
             session["room"] = room_name
+            print(f"  [STATE CHG] {user_id}: {old_state} → {state}"
+                  + (f" room={room_name}" if room_name else ""))
 
 
 def conn_label(conn):
@@ -265,36 +291,33 @@ def conn_label(conn):
 
 def print_state(label):
     with lock:
-        session_users = {
-            user_id: {
-                "conn": conn_label(session["conn"]),
-                "state": session.get("state", "lobby"),
-                "room": session.get("room"),
-            }
-            for user_id, session in sessions.items()
+        sess_info = {
+            uid: f"{s.get('state','?')}|{s.get('room') or '-'}"
+            for uid, s in sessions.items()
         }
-        client_users = [
-            {
-                "addr": client["addr"],
-                "user_id": client.get("user_id"),
-                "conn": hex(id(client["conn"])),
-            }
-            for client in clients
+        room_info = [
+            f"{get_room_name(r['body'])}@{r['creator']}[{','.join(r['players'])}]"
+            for r in rooms
         ]
-        room_state = [
-            {
-                "creator": room["creator"],
-                "session_user": room.get("session_user"),
-                "room": get_room_name(room["body"]),
-                "players": list(room["players"]),
-                "addr": room["addr"],
-            }
-            for room in rooms
+        cli_info = [
+            f"{c.get('conn_id','?')}:{c.get('user_id','?')}"
+            for c in clients
         ]
+    print(f"[STATE:{label}] sess={sess_info}")
+    print(f"[STATE:{label}] rooms={room_info}  clients={cli_info}")
 
-    print(f"[STATE {label}] sessions={session_users}")
-    print(f"[STATE {label}] clients={client_users}")
-    print(f"[STATE {label}] rooms={room_state}")
+
+def print_packet(conn, port, addr, packet_type, packet_size, body):
+    conn_id = get_conn_id(conn)
+    user = get_client_user(conn)
+    tid = threading.current_thread().ident % 10000
+    print(f"\n┌─ RECV [{now()}] [{conn_id}|{user}] port={port} tid={tid}")
+    print(f"│  {plabel(packet_type)}  size={packet_size}")
+    if body:
+        bhex = body.hex(" ") if len(body) <= 32 else body[:32].hex(" ") + " ..."
+        print(f"│  HEX : {bhex}")
+        print(f"│  TEXT: {decode_text(body)}")
+    print(f"└{'─'*55}")
 
 
 def make_lobby_chat_response(sender, message):
@@ -318,16 +341,16 @@ def broadcast_chat(packet):
 
 
 def broadcast_room_list_to_lobby(except_conn=None):
-    """Push user list + room list to all lobby-state clients.
+    """Push room list to all lobby-state clients (except_conn 제외).
 
-    Called after a room is created/removed so guests see the update without
-    having to press the room-list button again.
+    유저 목록(0x1FFF)은 보내지 않는다 — 클라이언트가 APPEND해서 무한 증가.
     """
     remove_stale_rooms()
     with lock:
         room_snapshot = [dict(room) for room in rooms]
         targets = [
-            (client["conn"], client["addr"], client.get("user_id", "unknown"))
+            (client["conn"], client["addr"], client.get("user_id", "unknown"),
+             client.get("conn_id", "C???"))
             for client in list(clients)
             if (
                 client.get("user_id") not in (None, "unknown")
@@ -339,18 +362,19 @@ def broadcast_room_list_to_lobby(except_conn=None):
         ]
 
     if not targets:
+        print("[ROOM LIST PUSH] 대상 없음 (로비 유저 없음)")
         return
 
-    # 방 목록 데이터만 push한다. 유저 목록(0x1FFF)을 보내면 클라이언트가
-    # 기존 목록에 APPEND해서 유저 리스트가 무한히 쌓인다.
-    combined = b"".join(make_room_list_packets(room_snapshot))
+    pkts = make_room_list_packets(room_snapshot)
+    combined = b"".join(pkts)
+    ptype_labels = [plabel(struct.unpack_from("<H", p, 0)[0]) for p in pkts if len(p) >= 2]
 
-    for conn, addr, user_id in targets:
+    for conn, addr, user_id, cid in targets:
         try:
             conn.sendall(combined)
-            print(f"[ROOM LIST PUSH] -> {addr} ({user_id})")
+            print(f"[ROOM LIST PUSH] → [{cid}|{user_id}] pkts={ptype_labels}")
         except OSError as e:
-            print(f"[ROOM LIST PUSH FAIL] {addr}: {e}")
+            print(f"[ROOM LIST PUSH FAIL] [{cid}|{user_id}] {addr}: {e}")
 
 
 def make_empty_room_list_packets():
@@ -370,9 +394,6 @@ def make_lobby_rejoin_packets():
 
 def make_channel_user_record(user):
     user_id = user["user_id"]
-
-    # The client parser expects an 18-byte user info block followed by a
-    # null-terminated user id. Zeroed fields are enough for the lobby list.
     user_info = struct.pack("<IIIIH", 0, 0, 0, 0, 0)
     return user_info + encode_text(user_id)
 
@@ -435,9 +456,6 @@ def make_room_list_record(room_body):
     if len(room_body) >= 6:
         max_players = max(2, struct.unpack_from("<H", room_body, 4)[0])
 
-    # Room make packets use an 8-byte prefix. The client's room-list parser
-    # expects a 10-byte record header: 4 bytes of flags, current/max players,
-    # then the byte length of the following detail block.
     list_flags = b"\x00\x00\x00\x00"
 
     return (
@@ -479,7 +497,7 @@ def remove_stale_rooms():
         removed = before - len(rooms)
 
     if removed:
-        print(f"[ROOM CLEANUP] removed stale rooms={removed}")
+        print(f"[ROOM CLEANUP] stale rooms removed={removed}")
 
 
 def remove_user_from_rooms(user_id):
@@ -538,30 +556,33 @@ def find_room_host_for_player(user_id):
 
 
 def notify_room_host_player_left(leaving_user):
-    """참가자가 방을 떠났을 때 호스트에게 업데이트된 유저/방 목록을 push한다."""
+    """참가자가 방을 떠났을 때 호스트에게 업데이트된 방 목록을 push한다."""
     host_info = find_room_host_for_player(leaving_user)
     if not host_info:
+        print(f"[HOST NOTIFY] {leaving_user} 의 호스트 없음 (방에 없거나 이미 나감)")
         return
     host_conn, host_addr, host_user = host_info
+    host_cid = get_conn_id(host_conn)
 
     remove_stale_rooms()
     with lock:
         room_snapshot = [dict(room) for room in rooms]
-    combined = b"".join(make_room_list_packets(room_snapshot))
+
+    pkts = make_room_list_packets(room_snapshot)
+    combined = b"".join(pkts)
+    ptype_labels = [plabel(struct.unpack_from("<H", p, 0)[0]) for p in pkts if len(p) >= 2]
     try:
         host_conn.sendall(combined)
         print(
-            f"[ROOM HOST NOTIFY] -> {host_addr} ({host_user}): "
-            f"player {leaving_user} left"
+            f"[HOST NOTIFY] → [{host_cid}|{host_user}]: "
+            f"{leaving_user} 퇴장  pkts={ptype_labels}"
         )
     except OSError as e:
-        print(f"[ROOM HOST NOTIFY FAIL] {host_addr}: {e}")
+        print(f"[HOST NOTIFY FAIL] [{host_cid}|{host_user}] {host_addr}: {e}")
 
 
 def leave_room_state(user_id):
     with lock:
-        removed_rooms = 0
-
         for room in rooms:
             if user_id in room["players"]:
                 room["players"].remove(user_id)
@@ -623,6 +644,9 @@ def room_body_contains_user(body, user_id):
 
 
 def get_responses(conn, addr, packet_type, body):
+    conn_id = get_conn_id(conn)
+    user = get_client_user(conn)
+
     # 9000 초기 인증
     if packet_type == 0x8001:
         return [make_packet(0x8001, b"\x00\x00")]
@@ -691,15 +715,13 @@ def get_responses(conn, addr, packet_type, body):
             user_id = parts[0]
             password = parts[1]
 
-            # IPX 릴레이 방지: 0x02FF에서 등록된 conn 유저(big)와 로그인
-            # user_id(user_a)가 다르면, 다른 PC가 릴레이한 로그인이다.
-            # 이 경우 세션을 만들면 안 된다(세션 conn이 릴레이어의 소켓을
-            # 가리켜 실제 유저의 연결이 깨진다). ACK만 보내고 무시한다.
+            # IPX 릴레이 방지: 0x02FF에서 등록된 conn 유저와 로그인 user_id가
+            # 다르면 다른 PC가 릴레이한 로그인이다. ACK만 보내고 무시.
             conn_user = get_client_user(conn)
             if conn_user not in ("unknown", user_id):
                 print(
-                    f"[LOGIN RELAY IGNORED] conn_user={conn_user}, "
-                    f"login_user={user_id}"
+                    f"[LOGIN RELAY IGNORED] [{conn_id}] "
+                    f"conn_user={conn_user}, login_user={user_id}"
                 )
                 return [make_packet(0x05FF, b"\x00\x00")]
 
@@ -707,15 +729,16 @@ def get_responses(conn, addr, packet_type, body):
 
             with lock:
                 if user_id not in accounts:
-                    print(f"[LOGIN FAILED] unknown account id={user_id}")
-                    return [make_packet(0x05FF, b"\x01\x00")]
-
-                if accounts[user_id]["password"] != password:
-                    print(f"[LOGIN FAILED] wrong password id={user_id}")
-                    return [make_packet(0x05FF, b"\x02\x00")]
+                    accounts[user_id] = {
+                        "password": password,
+                        "created_at": now(),
+                        "addr": addr,
+                    }
+                    save_accounts()
+                    print(f"[AUTO ACCOUNT] created id={user_id}")
 
                 if user_id in sessions:
-                    print(f"[LOGIN REPLACED] duplicate login id={user_id}")
+                    print(f"[LOGIN REPLACED] duplicate login id={user_id} [{conn_id}]")
                     old_conn = sessions[user_id].get("conn")
 
                 sessions[user_id] = {
@@ -729,16 +752,12 @@ def get_responses(conn, addr, packet_type, body):
             if old_conn is not None and old_conn is not conn:
                 dropped = drop_conn_state(old_conn)
                 close_socket_quietly(old_conn)
-                print(f"[LOGIN REPLACED] closed old session id={user_id}, dropped={dropped}")
+                print(f"[LOGIN REPLACED] closed old conn id={user_id}, dropped={dropped}")
 
             set_client_user(conn, user_id)
-            print(f"[LOGIN OK] id={user_id}")
+            print(f"[LOGIN OK] [{conn_id}] id={user_id} addr={addr}")
             print_state("LOGIN")
 
-            # 로그인 직후 채널 입장(0x09/0x0A/0x0B) + 유저/방 목록을 함께 보낸다.
-            # 채널 입장만 보내면 일부 클라이언트(test1 등)가 "방목록 버튼" 클릭 시
-            # 서버에 0x0BFF를 보내지 않고 서버 push를 기다리며 멈춘다.
-            # 로그인 즉시 현재 목록을 내려주면 다이얼로그가 즉시 해소된다.
             remove_stale_rooms()
             with lock:
                 room_snapshot_login = [dict(room) for room in rooms]
@@ -750,21 +769,17 @@ def get_responses(conn, addr, packet_type, body):
                 + make_room_list_packets(room_snapshot_login)
             )
 
-        print("[LOGIN FAILED] invalid body")
+        print(f"[LOGIN FAILED] [{conn_id}] invalid body")
         return [make_packet(0x05FF, b"\x04\x00")]
 
     # 계정 / 닉네임 정보
-    # 클라이언트는 채널 재조인(0x09/0x0A/0x0B) 수신 후 0x07FF를 보낸다.
-    #   · 로그인 직후: body = 게임이름(太祖王建, 9+ bytes)
-    #   · 방 나가기 후: body = \x00 (1 byte)
-    # 로그인 직후엔 이미 0x05FF 응답에 유저/방 목록이 포함돼 있으므로
-    # 여기서 다시 보내면 목록이 중복으로 쌓여 클라이언트가 꼬인다.
-    # 방 나가기 후(body 짧음)에만 유저/방 목록을 내려준다.
+    # · 로그인 직후: body = 게임이름(太祖王建, 9+ bytes) → 목록 중복 방지로 ACK만
+    # · 방 나가기 후: body = \x00 (1 byte) → 유저/방 목록 내려줌
     if packet_type == 0x07FF:
-        user = get_client_user(conn)
-        print(f"[ACCOUNT INFO] user={user}")
+        print(f"[ACCT_INFO] [{conn_id}|{user}] body_len={len(body)}")
 
         if len(body) <= 1:
+            print(f"  → post-room-exit 분기: 유저/방 목록 전송")
             remove_stale_rooms()
             with lock:
                 room_snapshot_07 = [dict(room) for room in rooms]
@@ -775,40 +790,35 @@ def get_responses(conn, addr, packet_type, body):
                 + make_room_list_packets(room_snapshot_07)
             )
 
+        print(f"  → login-after 분기: ACK만")
         return [make_packet(0x07FF, b"\x00\x00")]
 
-    # 방 목록 요청
+    # 방 목록 요청 (클라이언트→서버: 0x0BFF)
+    # 주의: 서버→클라이언트의 0x0BFF는 채널 재조인 신호 — 의미가 다르다.
     if packet_type == 0x0BFF:
-        user = get_client_user(conn)
         remove_stale_rooms()
 
         with lock:
             room_snapshot = [dict(room) for room in rooms]
 
-        print(f"[ROOM LIST REQUEST] user={user}, rooms={len(room_snapshot)}")
-
+        print(f"[ROOM LIST REQ] [{conn_id}|{user}] rooms={len(room_snapshot)}")
         for room in room_snapshot:
             print(
-                "[ROOM LIST ITEM] "
-                f"creator={room['creator']}, "
-                f"created_at={room['created_at'].strftime('%H:%M:%S')}, "
-                f"body={decode_text(room['body'])}"
+                f"  room: {get_room_name(room['body'])!r}"
+                f"  creator={room['creator']}"
+                f"  players={room['players']}"
+                f"  at={room['created_at'].strftime('%H:%M:%S')}"
             )
 
-        # 유저 목록(0x1FFF)을 여기서 보내면 안 된다. 클라이언트는 0x1FFF를
-        # 받을 때마다 기존 목록에 APPEND해서 유저 리스트가 무한히 쌓인다.
-        # 유저 목록은 로그인(0x05FF)·방 나가기(0x07FF post-exit)에서만 보낸다.
+        # 유저 목록(0x1FFF)은 보내지 않는다 — APPEND돼서 무한 증가.
         return make_room_list_packets(room_snapshot)
 
     if packet_type == 0x1FFF:
-        user = get_client_user(conn)
         users = get_active_users()
-
         print(
-            "[CHANNEL USER LIST REQUEST] "
-            f"user={user}, users={[item['user_id'] for item in users]}"
+            f"[USER LIST REQ] [{conn_id}|{user}] "
+            f"users={[u['user_id'] for u in users]}"
         )
-
         return make_channel_user_list_packets(users)
 
     # 방 생성 요청
@@ -816,7 +826,6 @@ def get_responses(conn, addr, packet_type, body):
         session_user = get_client_user(conn)
         creator = session_user
         body_text = decode_text(body)
-        parts = split_null_strings(body)
         body_owner = get_room_owner_from_body(body)
         remove_stale_rooms()
 
@@ -827,21 +836,15 @@ def get_responses(conn, addr, packet_type, body):
             set_client_user(conn, creator)
 
         if creator == "unknown":
-            print("[ROOM CREATE REJECTED] unknown session")
+            print(f"[ROOM CREATE REJECTED] [{conn_id}] unknown session")
             return [make_packet(0x0EFF, b"\x01\x00")]
 
-        # 이 게임은 방 정보를 IPX 브로드캐스트로 퍼뜨려서, 방 주인이 아닌
-        # 로비의 다른 클라이언트도 같은 방(owner=다른 유저)을 서버에 보고한다.
-        # 예전엔 session_user != body_owner면 거부(0x02 → "같은 이름의 방 존재")
-        # 했는데, 이게 옆 사람(test1) 화면을 깨고 방 주인의 방 등록까지 막아
-        # 방장(user_a)은 "방만들기 요청중"에서 멈췄다. 거부하지 말고 방 주인
-        # 명의로 등록한다.
+        # IPX 브로드캐스트로 다른 로비 클라이언트도 같은 방 정보를 서버로 보낸다.
+        # 거부하면 방 주인의 방 등록이 막히므로, 방 주인 명의로 등록한다.
         reported_by_other = (
             session_user != "unknown" and body_owner and session_user != body_owner
         )
 
-        # 호스트 접속 주소는 방 주인의 세션 주소를 우선 사용한다. 주인이 아닌
-        # 사람이 보고하면 그 사람 주소가 호스트로 잘못 박히기 때문이다.
         host_addr = addr
         with lock:
             owner_session = sessions.get(creator)
@@ -858,9 +861,6 @@ def get_responses(conn, addr, packet_type, body):
         })
         set_user_state(creator, "room", get_room_name(body))
 
-        # 방이 생성됐음을 로비에 있는 다른 유저들에게 즉시 push한다.
-        # 동기 호출하면 대상 소켓 버퍼가 차있을 때 현재 핸들러까지 블로킹하므로
-        # 별도 스레드에서 보낸다.
         threading.Thread(
             target=broadcast_room_list_to_lobby,
             args=(conn,),
@@ -868,24 +868,28 @@ def get_responses(conn, addr, packet_type, body):
         ).start()
 
         if reported_by_other:
-            print(f"[ROOM CREATE SYNCED] reporter={session_user}, owner={creator}")
-        print("[ROOM CREATE OK]")
-        print(f"CREATOR       : {creator}")
-        print(f"ROOM BODY HEX : {body.hex(' ')}")
-        print(f"ROOM BODY TEXT: {body_text}")
+            print(
+                f"[ROOM CREATE SYNCED] [{conn_id}] "
+                f"reporter={session_user}, owner={creator}"
+            )
+        print(
+            f"[ROOM CREATE OK] [{conn_id}] creator={creator}"
+            f"  room={get_room_name(body)!r}"
+        )
         print_state("ROOM_CREATE")
 
-        # 원문 echo 금지, OK만 응답
         return [make_packet(0x0EFF, b"\x00\x00")]
 
     if packet_type == 0x10FF:
-        user = get_client_user(conn)
         requested = split_null_strings(body)
         requested_name = requested[0] if requested else ""
         room = find_room_by_request(body)
 
         if not room:
-            print(f"[ROOM JOIN FAILED] user={user}, requested={requested_name}")
+            print(
+                f"[ROOM JOIN FAILED] [{conn_id}|{user}] "
+                f"requested={requested_name!r} (방 없음)"
+            )
             return [make_packet(0x10FF, b"\x01")]
 
         room_name_bytes = get_room_name_bytes(room["body"])
@@ -901,9 +905,9 @@ def get_responses(conn, addr, packet_type, body):
                     break
 
         print(
-            "[ROOM JOIN OK] "
-            f"user={user}, requested={requested_name}, "
-            f"room={decode_text(room_name_bytes)}, host_ip={host_ip}"
+            f"[ROOM JOIN OK] [{conn_id}|{user}]"
+            f"  room={decode_text(room_name_bytes)!r}"
+            f"  host_ip={host_ip}"
         )
         print_state("ROOM_JOIN")
 
@@ -912,11 +916,9 @@ def get_responses(conn, addr, packet_type, body):
 
     # 방 취소 / 채널 재조인
     if packet_type == 0x11FF:
-        user = get_client_user(conn)
-        print(f"[ROOM EXIT / CHANNEL REJOIN] user={user}")
+        print(f"[ROOM EXIT] [{conn_id}|{user}]")
         if user != "unknown":
-            # 참가자가 나가면 호스트에게 알린다(호스트 알림은 방 제거 전에
-            # 호스트를 찾아야 하므로 remove보다 먼저 호출).
+            # 참가자 퇴장 시 호스트에게 먼저 알린다 (방 제거 전에 호스트를 찾아야 함).
             threading.Thread(
                 target=notify_room_host_player_left,
                 args=(user,),
@@ -926,20 +928,14 @@ def get_responses(conn, addr, packet_type, body):
             set_user_state(user, "lobby", None)
             print_state("ROOM_EXIT")
 
-        # 방이 제거됐으므로 로비에 있는 다른 클라이언트에게 방 목록을 push한다.
-        # 동기 호출하면 대상 소켓이 블로킹될 때 현재 유저의 응답까지 멈추므로
-        # 별도 스레드에서 보낸다.
+        # 방 제거 후 로비 유저들에게 방 목록 push (비동기).
         threading.Thread(
             target=broadcast_room_list_to_lobby,
             args=(conn,),
             daemon=True,
         ).start()
 
-        # ack + 채널 재조인(0x09/0x0A/0x0B)만 보낸다.
-        # inline으로 유저/방 목록까지 보내면 클라이언트가 채널 재조인 시퀀스 도중
-        # 받은 목록 패킷을 처리하지 못하고 로비 복귀에 실패할 수 있다.
-        # 클라이언트는 0x0BFF를 받은 후 자연스럽게 0x0BFF 요청을 보내고
-        # 서버가 그에 응답해 목록을 받는다.
+        # ACK + 채널 재조인만. 유저/방 목록은 클라이언트가 0x0BFF 요청 후 받는다.
         return (
             [make_packet(0x11FF, b"\x00\x00")]
             + make_lobby_rejoin_packets()
@@ -951,13 +947,14 @@ def get_responses(conn, addr, packet_type, body):
         sender = get_client_user(conn)
 
         if message == "/status":
+            print_state("CHAT_STATUS")
             return [make_packet(0x12FF, b"\x00\x00")]
 
         if sender == "unknown":
-            print(f"[CHAT IGNORED] unknown sender message={message}")
+            print(f"[CHAT IGNORED] [{conn_id}] unknown sender msg={message!r}")
             return [make_packet(0x12FF, b"\x01\x00")]
 
-        print(f"[CHAT RECEIVED] {sender}: {message}")
+        print(f"[CHAT] [{conn_id}|{sender}]: {message}")
 
         chat_packet = make_lobby_chat_response(sender, message)
         broadcast_chat(chat_packet)
@@ -965,18 +962,12 @@ def get_responses(conn, addr, packet_type, body):
         return []
 
     if packet_type == 0x24FF:
-        user = get_client_user(conn)
-        print(f"[GAME REPORT] user={user}")
+        print(f"[GAME REPORT] [{conn_id}|{user}]")
         if user != "unknown":
             leave_room_state(user)
             set_user_state(user, "lobby", None)
             print_state("GAME_REPORT")
 
-        # 게임 종료 후 점수판에서 '확인'을 누르면 로비 채널로 복귀해야 한다.
-        # ack(0x24FF)만 보내면 "채널을 조인중입니다"에서 멈추므로
-        # 채널 재조인(0x09/0x0A/0x0B)을 함께 내려준다.
-        # 유저/방 목록은 inline으로 보내지 않고, 채널 재조인 후 클라이언트가
-        # 자연스럽게 0x0BFF를 보내면 그 응답으로 보낸다.
         threading.Thread(
             target=broadcast_room_list_to_lobby,
             args=(conn,),
@@ -987,30 +978,34 @@ def get_responses(conn, addr, packet_type, body):
             + make_lobby_rejoin_packets()
         )
 
+    print(f"[UNHANDLED] [{conn_id}|{user}] {plabel(packet_type)}")
     return [make_packet(packet_type, b"\x00\x00")]
 
 
 def send_response(conn, addr, response):
-    print(f"[{now()}] SEND to {addr}")
-    print(response.hex(" "))
-
+    conn_id = get_conn_id(conn)
+    user = get_client_user(conn)
+    if len(response) >= 4:
+        ptype = struct.unpack_from("<H", response, 0)[0]
+        psize = struct.unpack_from("<H", response, 2)[0]
+        pbody = response[4:4 + max(0, psize - 4)]
+        bsummary = pbody.hex(" ") if len(pbody) <= 20 else pbody[:20].hex(" ") + "..."
+        print(f"  → [{conn_id}|{user}] {plabel(ptype)} size={psize} body=[{bsummary}]")
+    else:
+        print(f"  → [{conn_id}|{user}] raw={response.hex(' ')}")
     try:
         conn.sendall(response)
     except OSError as e:
-        print(f"[{now()}] SEND ERROR {addr}: {e}")
+        print(f"  ! [{conn_id}|{user}] SEND ERROR: {e}")
 
 
 def cleanup_disconnect(conn, addr, port):
-    # 연결이 어떤 식으로 끊겼든(정상 종료/소켓 에러/예외) 항상 호출되어
-    # 죽은 연결을 clients/sessions에서 제거한다. 정리를 건너뛰면 죽은
-    # 연결이 유령으로 남아 다른 유저 목록/접속을 망가뜨린다.
     disconnected_user = get_client_user(conn)
 
     if port != 6112:
         return
 
-    # 방에 참가자로 있었으면 호스트에게 알림 (세션/clients 제거 전에 해야
-    # 호스트를 찾을 수 있다).
+    # 방에 참가자로 있었으면 호스트에게 알림 (세션/clients 제거 전에 해야 호스트를 찾을 수 있다).
     if disconnected_user != "unknown":
         threading.Thread(
             target=notify_room_host_player_left,
@@ -1025,17 +1020,10 @@ def cleanup_disconnect(conn, addr, port):
                 clients.remove(client)
 
         # 이 conn이 현재 세션의 주인일 때만 세션을 지운다.
-        # (이미 다른 새 연결로 대체됐다면 그 세션은 건드리지 않는다.)
         if disconnected_user != "unknown":
             session = sessions.get(disconnected_user)
             if session and session.get("conn") is conn:
                 sessions.pop(disconnected_user, None)
-
-    if disconnected_user != "unknown":
-        print(
-            "[DISCONNECT] keep advertised rooms until TTL "
-            f"user={disconnected_user}"
-        )
 
     print(f"[DISCONNECT] user={disconnected_user}")
     print_state("DISCONNECT")
@@ -1047,11 +1035,14 @@ def tcp_server(port):
     server.bind(("0.0.0.0", port))
     server.listen(20)
 
-    print(f"TCP listening on {port}")
+    print(f"TCP listening on port {port}")
 
     while True:
         conn, addr = server.accept()
-        print(f"\n[{now()}] TCP connected {addr} -> port {port}")
+        conn_id = alloc_conn_id()
+
+        print(f"\n{'═'*60}")
+        print(f"[{now()}] TCP CONNECT {conn_id} {addr} port={port}")
 
         if port == 6112:
             with lock:
@@ -1059,9 +1050,13 @@ def tcp_server(port):
                     "conn": conn,
                     "addr": addr,
                     "user_id": None,
+                    "conn_id": conn_id,
                 })
 
-        def handle_client():
+        # BUG FIX: 기본 인자로 값을 고정해 클로저 변수 공유 문제를 방지한다.
+        # def handle_client(): 로 쓰면 conn/addr이 루프 변수를 공유해
+        # 두 번째 클라이언트 접속 시 첫 번째 스레드가 두 번째 소켓으로 recv한다.
+        def handle_client(conn=conn, addr=addr, conn_id=conn_id):
             remain = b""
 
             try:
@@ -1069,42 +1064,41 @@ def tcp_server(port):
                     try:
                         data = conn.recv(4096)
                     except (ConnectionResetError, ConnectionAbortedError):
-                        print(f"[{now()}] TCP reset by client {addr}")
+                        print(f"[{now()}] TCP RESET {conn_id} {addr}")
                         break
                     except OSError as e:
-                        # 소켓이 다른 경로에서 닫혔거나(WinError 10038 등) 비정상
-                        # 종료된 경우. 스레드를 죽이지 말고 깔끔히 빠져나간다.
-                        print(f"[{now()}] TCP recv error {addr}: {e}")
+                        print(f"[{now()}] TCP RECV ERR {conn_id} {addr}: {e}")
                         break
 
                     if not data:
-                        print(f"[{now()}] TCP closed {addr}")
+                        print(f"[{now()}] TCP CLOSED {conn_id} {addr}")
                         break
-
-                    print()
-                    print(f"[{now()}] TCP RAW from {addr} / port {port} / {len(data)} bytes")
-                    print(data.hex(" "))
 
                     packets, remain = parse_packets(remain + data)
 
+                    if remain:
+                        print(
+                            f"  [PARTIAL] {conn_id} {len(remain)}바이트 대기중: "
+                            f"{remain.hex(' ')}"
+                        )
+
                     for packet_type, packet_size, body in packets:
-                        print_packet(port, addr, packet_type, packet_size, body)
+                        print_packet(conn, port, addr, packet_type, packet_size, body)
 
                         try:
                             responses = get_responses(conn, addr, packet_type, body)
                         except Exception:
-                            # 한 패킷 처리 중 예외가 나도 연결을 끊지 않는다.
-                            # 핸들러 예외로 스레드가 죽으면 해당 유저의 접속이
-                            # 끊기고, 재접속/재로그인 과정에서 다른 유저(호스트)까지
-                            # 튕기는 것처럼 보일 수 있으므로 방어한다.
-                            print(f"[HANDLER ERROR] type=0x{packet_type:04X} from {addr}")
+                            print(
+                                f"[HANDLER ERROR] {plabel(packet_type)} "
+                                f"[{conn_id}]"
+                            )
                             traceback.print_exc()
                             responses = [make_packet(packet_type, b"\x00\x00")]
 
                         for response in responses:
                             send_response(conn, addr, response)
             finally:
-                # 정상 종료/소켓 에러/예외 어느 경우든 반드시 정리한다.
+                print(f"[{now()}] TCP DISCONNECT {conn_id} {addr}")
                 close_socket_quietly(conn)
                 cleanup_disconnect(conn, addr, port)
 
@@ -1116,13 +1110,12 @@ def udp_server(port):
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", port))
 
-    print(f"UDP listening on {port}")
+    print(f"UDP listening on port {port}")
 
     while True:
         data, addr = server.recvfrom(4096)
         print()
-        print(f"[{now()}] UDP RAW from {addr} / port {port} / {len(data)} bytes")
-        print(data.hex(" "))
+        print(f"[{now()}] UDP {addr} port={port} {len(data)}B: {data[:32].hex(' ')}")
 
 
 def main():
@@ -1130,11 +1123,11 @@ def main():
     load_accounts()
     ensure_default_accounts()
 
-    print("Dummy server running. Press Enter to stop.")
-    print("Recommended accounts:")
-    print("  A PC: user_a / 1111")
-    print("  B PC: user_b / 2222")
-    print(f"Rooms stay visible for {ROOM_TTL_SECONDS // 60} minutes after creation.")
+    print("=" * 60)
+    print("태조왕건 더미서버 시작. Enter 키로 종료.")
+    print("채팅창에서 /status 입력 시 현재 세션/방 상태를 로그에 출력합니다.")
+    print(f"방은 생성 후 {ROOM_TTL_SECONDS // 60}분 동안 유지됩니다.")
+    print("=" * 60)
 
     for port in UDP_PORTS:
         threading.Thread(target=udp_server, args=(port,), daemon=True).start()
