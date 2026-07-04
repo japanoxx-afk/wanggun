@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.1"
+SERVER_VERSION = "1.2"
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000, 6112]
@@ -516,40 +516,29 @@ def get_room_owner_from_body(room_body):
     return parts[-1] if parts else ""
 
 
-def make_room_list_record(room_body):
+def make_room_list_record(room):
+    """방 목록 레코드를 클라이언트의 native 형식으로 만든다.
+
+    이전에는 서버가 [flags:4][cur:2][max:2][detaillen:2][name][detail] 형태로
+    재구성했는데, 이는 클라이언트가 방 생성(0x0EFF) 시 보낸 원본 형식과
+    헤더가 2바이트 어긋난다. 클라이언트가 생성/목록에 같은 파서를 쓰면
+    레코드가 밀려 목록이 화면에 뜨지 않는다.
+
+    가장 안전한 방법은 클라이언트가 보낸 원본 body를 그대로 되돌려주는 것이다
+    (클라이언트가 직렬화했으니 역직렬화도 된다). 현재 인원수만 실제 값으로
+    갱신한다. body 구조: [status:2][현재인원:2][최대인원:2][detail길이:2][이름\0]...
+    """
+    room_body = room["body"]
     if len(room_body) < 9:
         print("[ROOM LIST SKIP] room body too short")
         return b""
 
-    room_name, room_detail = split_first_null(room_body[8:])
+    # 현재 인원수를 실제 참가자 수로 갱신([2:4] 필드).
+    player_count = max(1, len(room.get("players", [])))
+    record = bytearray(room_body)
+    struct.pack_into("<H", record, 2, player_count)
 
-    if not room_name or not room_detail:
-        print("[ROOM LIST SKIP] missing room name/detail")
-        return b""
-
-    expected_detail_len = 0
-    if len(room_body) >= 8:
-        expected_detail_len = struct.unpack_from("<H", room_body, 6)[0]
-
-    if (
-        expected_detail_len > 0
-        and len(room_detail) == expected_detail_len + 1
-        and room_detail[:1] == b"\x00"
-    ):
-        room_detail = room_detail[1:]
-
-    max_players = 2
-    if len(room_body) >= 6:
-        max_players = max(2, struct.unpack_from("<H", room_body, 4)[0])
-
-    list_flags = b"\x00\x00\x00\x00"
-
-    return (
-        list_flags
-        + struct.pack("<HHH", 1, max_players, len(room_detail))
-        + room_name
-        + room_detail
-    )
+    return bytes(record)
 
 
 def make_room_list_packets(room_snapshot):
@@ -559,7 +548,7 @@ def make_room_list_packets(room_snapshot):
     list_body = b""
 
     for room in room_snapshot:
-        list_body += make_room_list_record(room["body"])
+        list_body += make_room_list_record(room)
 
     if not list_body:
         return make_empty_room_list_packets()
@@ -899,6 +888,9 @@ def get_responses(conn, addr, packet_type, body):
                 f"  players={room['players']}"
                 f"  at={room['created_at'].strftime('%H:%M:%S')}"
             )
+            # native 형식으로 되돌려주는 방 레코드의 실제 바이트를 남긴다.
+            rec = make_room_list_record(room)
+            print(f"  record({len(rec)}B): {rec.hex(' ')}")
 
         # 유저 목록(0x1FFF)은 보내지 않는다 — APPEND돼서 무한 증가.
         return make_room_list_packets(room_snapshot)
