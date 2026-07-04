@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import traceback
+import weakref
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000]
@@ -44,6 +45,39 @@ PACKET_NAMES = {
 # 연결별 ID 카운터
 _conn_counter = 0
 _conn_counter_lock = threading.Lock()
+
+# 연결별 send 락: 핸들러 스레드와 broadcast/알림 스레드가 같은 소켓에
+# 동시에 sendall하면 패킷이 뒤섞여 클라이언트가 멈춘다. 소켓별로 직렬화.
+_send_locks = weakref.WeakKeyDictionary()
+_send_locks_guard = threading.Lock()
+
+# 상대 클라이언트가 멈춰 소켓 버퍼가 가득 차도 서버 스레드가 영원히
+# 붙잡히지 않도록 send 타임아웃(ms)을 건다.
+SEND_TIMEOUT_MS = 5000
+
+
+def get_send_lock(conn):
+    with _send_locks_guard:
+        lock_obj = _send_locks.get(conn)
+        if lock_obj is None:
+            lock_obj = threading.Lock()
+            _send_locks[conn] = lock_obj
+        return lock_obj
+
+
+def safe_send(conn, data):
+    """소켓별 락으로 직렬화된 sendall. 여러 스레드가 같은 conn에 보낼 때
+    패킷 인터리빙을 방지한다."""
+    with get_send_lock(conn):
+        conn.sendall(data)
+
+
+def set_send_timeout(conn, ms):
+    try:
+        # Windows: SO_SNDTIMEO = DWORD(밀리초)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("<L", ms))
+    except OSError:
+        pass
 
 
 class TeeOutput:
@@ -326,18 +360,19 @@ def make_lobby_chat_response(sender, message):
 
 
 def broadcast_chat(packet):
-    dead = []
-
+    # 전역 lock을 잡은 채 sendall하면 한 클라이언트의 소켓이 막혔을 때
+    # 서버 전체가 멈춘다. 대상을 스냅샷하고 lock 밖에서 보낸다.
     with lock:
-        for client in clients:
-            try:
-                client["conn"].sendall(packet)
-            except OSError:
-                dead.append(client)
+        targets = [
+            (c["conn"], c.get("conn_id", "C???"), c.get("user_id", "?"))
+            for c in clients
+        ]
 
-        for client in dead:
-            if client in clients:
-                clients.remove(client)
+    for conn, cid, uid in targets:
+        try:
+            safe_send(conn, packet)
+        except OSError as e:
+            print(f"[CHAT SEND FAIL] [{cid}|{uid}]: {e}")
 
 
 def broadcast_room_list_to_lobby(except_conn=None):
@@ -371,7 +406,7 @@ def broadcast_room_list_to_lobby(except_conn=None):
 
     for conn, addr, user_id, cid in targets:
         try:
-            conn.sendall(combined)
+            safe_send(conn, combined)
             print(f"[ROOM LIST PUSH] → [{cid}|{user_id}] pkts={ptype_labels}")
         except OSError as e:
             print(f"[ROOM LIST PUSH FAIL] [{cid}|{user_id}] {addr}: {e}")
@@ -555,9 +590,13 @@ def find_room_host_for_player(user_id):
     return None
 
 
-def notify_room_host_player_left(leaving_user):
-    """참가자가 방을 떠났을 때 호스트에게 업데이트된 방 목록을 push한다."""
-    host_info = find_room_host_for_player(leaving_user)
+def notify_room_host_player_left(leaving_user, host_info):
+    """참가자가 방을 떠났을 때 호스트에게 업데이트된 방 목록을 push한다.
+
+    host_info는 호출자가 방 제거 *전에* find_room_host_for_player()로
+    미리 캡처해서 넘긴다. 이 함수 안에서 찾으면 별도 스레드 실행 시점에
+    방이 이미 제거돼 호스트를 못 찾는 레이스가 생긴다.
+    """
     if not host_info:
         print(f"[HOST NOTIFY] {leaving_user} 의 호스트 없음 (방에 없거나 이미 나감)")
         return
@@ -572,7 +611,7 @@ def notify_room_host_player_left(leaving_user):
     combined = b"".join(pkts)
     ptype_labels = [plabel(struct.unpack_from("<H", p, 0)[0]) for p in pkts if len(p) >= 2]
     try:
-        host_conn.sendall(combined)
+        safe_send(host_conn, combined)
         print(
             f"[HOST NOTIFY] → [{host_cid}|{host_user}]: "
             f"{leaving_user} 퇴장  pkts={ptype_labels}"
@@ -918,10 +957,11 @@ def get_responses(conn, addr, packet_type, body):
     if packet_type == 0x11FF:
         print(f"[ROOM EXIT] [{conn_id}|{user}]")
         if user != "unknown":
-            # 참가자 퇴장 시 호스트에게 먼저 알린다 (방 제거 전에 호스트를 찾아야 함).
+            # 호스트 정보는 방 제거 전에 동기적으로 캡처하고, 전송만 비동기로.
+            host_info = find_room_host_for_player(user)
             threading.Thread(
                 target=notify_room_host_player_left,
-                args=(user,),
+                args=(user, host_info),
                 daemon=True,
             ).start()
             remove_user_from_rooms(user)
@@ -982,19 +1022,31 @@ def get_responses(conn, addr, packet_type, body):
     return [make_packet(packet_type, b"\x00\x00")]
 
 
-def send_response(conn, addr, response):
+def send_responses(conn, addr, responses):
+    """핸들러 응답 여러 개를 하나의 버퍼로 묶어 send 락 아래에서 한 번에 보낸다.
+
+    패킷 단위로 따로 보내면 로그인 응답(0x05FF + 채널조인 + 목록)처럼
+    여러 패킷으로 된 시퀀스 중간에 broadcast 스레드의 push가 끼어들어
+    클라이언트가 시퀀스를 잘못 해석할 수 있다.
+    """
+    if not responses:
+        return
+
     conn_id = get_conn_id(conn)
     user = get_client_user(conn)
-    if len(response) >= 4:
-        ptype = struct.unpack_from("<H", response, 0)[0]
-        psize = struct.unpack_from("<H", response, 2)[0]
-        pbody = response[4:4 + max(0, psize - 4)]
-        bsummary = pbody.hex(" ") if len(pbody) <= 20 else pbody[:20].hex(" ") + "..."
-        print(f"  → [{conn_id}|{user}] {plabel(ptype)} size={psize} body=[{bsummary}]")
-    else:
-        print(f"  → [{conn_id}|{user}] raw={response.hex(' ')}")
+
+    for response in responses:
+        if len(response) >= 4:
+            ptype = struct.unpack_from("<H", response, 0)[0]
+            psize = struct.unpack_from("<H", response, 2)[0]
+            pbody = response[4:4 + max(0, psize - 4)]
+            bsummary = pbody.hex(" ") if len(pbody) <= 20 else pbody[:20].hex(" ") + "..."
+            print(f"  → [{conn_id}|{user}] {plabel(ptype)} size={psize} body=[{bsummary}]")
+        else:
+            print(f"  → [{conn_id}|{user}] raw={response.hex(' ')}")
+
     try:
-        conn.sendall(response)
+        safe_send(conn, b"".join(responses))
     except OSError as e:
         print(f"  ! [{conn_id}|{user}] SEND ERROR: {e}")
 
@@ -1005,11 +1057,13 @@ def cleanup_disconnect(conn, addr, port):
     if port != 6112:
         return
 
-    # 방에 참가자로 있었으면 호스트에게 알림 (세션/clients 제거 전에 해야 호스트를 찾을 수 있다).
+    # 방에 참가자로 있었으면 호스트에게 알림.
+    # 호스트 정보는 방/세션 제거 전에 동기적으로 캡처하고, 전송만 비동기로.
     if disconnected_user != "unknown":
+        host_info = find_room_host_for_player(disconnected_user)
         threading.Thread(
             target=notify_room_host_player_left,
-            args=(disconnected_user,),
+            args=(disconnected_user, host_info),
             daemon=True,
         ).start()
         leave_room_state(disconnected_user)
@@ -1040,6 +1094,9 @@ def tcp_server(port):
     while True:
         conn, addr = server.accept()
         conn_id = alloc_conn_id()
+
+        # 멈춘 클라이언트의 소켓 버퍼가 가득 차도 send가 영원히 막히지 않게.
+        set_send_timeout(conn, SEND_TIMEOUT_MS)
 
         print(f"\n{'═'*60}")
         print(f"[{now()}] TCP CONNECT {conn_id} {addr} port={port}")
@@ -1095,8 +1152,7 @@ def tcp_server(port):
                             traceback.print_exc()
                             responses = [make_packet(packet_type, b"\x00\x00")]
 
-                        for response in responses:
-                            send_response(conn, addr, response)
+                        send_responses(conn, addr, responses)
             finally:
                 print(f"[{now()}] TCP DISCONNECT {conn_id} {addr}")
                 close_socket_quietly(conn)
