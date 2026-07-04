@@ -9,8 +9,10 @@ import traceback
 import weakref
 
 TCP_PORTS = [9000, 6112]
-UDP_PORTS = [9000]
-MAX_PACKET_SIZE = 1024
+UDP_PORTS = [9000, 6112]
+# 방 정보 body가 1024를 넘는 경우 정상 패킷이 '깨진 헤더'로 오인되어
+# 파서가 멈추는 사고를 막기 위해 여유 있게 잡는다 (size 필드는 u16).
+MAX_PACKET_SIZE = 8192
 ROOM_TTL_SECONDS = 10 * 60
 DEFAULT_CHANNEL_NAME = b"\xf7\xbc\xf0\xd5\xe8\xdd\xcb\xef\x00"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -173,7 +175,7 @@ def make_packet(packet_type, body=b""):
     return struct.pack("<HH", packet_type, 4 + len(body)) + body
 
 
-def parse_packets(buffer):
+def parse_packets(buffer, conn_id="C???"):
     packets = []
     offset = 0
 
@@ -181,8 +183,17 @@ def parse_packets(buffer):
         packet_type, packet_size = struct.unpack_from("<HH", buffer, offset)
 
         if packet_size < 4 or packet_size > MAX_PACKET_SIZE:
-            print(f"[WARN] Invalid packet size: type={plabel(packet_type)}, size={packet_size}")
-            break
+            # 잘못된 헤더를 버퍼에 남겨두면 이후 도착하는 모든 패킷이
+            # 그 뒤에 붙어 영원히 파싱되지 않는다(연결이 조용히 죽음).
+            # 깨진 데이터는 로그로 남기고 버린 뒤 새로 시작한다.
+            bad = buffer[offset:]
+            print(
+                f"[PARSE DESYNC] [{conn_id}] invalid header "
+                f"type=0x{packet_type:04X} size={packet_size} — "
+                f"{len(bad)}바이트 폐기: {bad[:64].hex(' ')}"
+                + (" ..." if len(bad) > 64 else "")
+            )
+            return packets, b""
 
         if len(buffer) - offset < packet_size:
             break
@@ -1167,12 +1178,21 @@ def tcp_server(port):
                         print(f"[{now()}] TCP CLOSED {conn_id} {addr}")
                         break
 
-                    packets, remain = parse_packets(remain + data)
+                    # 수신된 원시 바이트는 파싱 성공 여부와 무관하게 무조건 남긴다.
+                    # "버튼을 눌렀는데 서버 로그에 아무것도 없다"를 판별하는 근거.
+                    print(
+                        f"\n[{now()}] RAW [{conn_id}|{get_client_user(conn)}] "
+                        f"port={port} {len(data)}B: {data[:96].hex(' ')}"
+                        + (" ..." if len(data) > 96 else "")
+                    )
+
+                    packets, remain = parse_packets(remain + data, conn_id)
 
                     if remain:
                         print(
                             f"  [PARTIAL] {conn_id} {len(remain)}바이트 대기중: "
-                            f"{remain.hex(' ')}"
+                            f"{remain[:64].hex(' ')}"
+                            + (" ..." if len(remain) > 64 else "")
                         )
 
                     for packet_type, packet_size, body in packets:
@@ -1200,14 +1220,23 @@ def tcp_server(port):
 def udp_server(port):
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", port))
+    try:
+        server.bind(("0.0.0.0", port))
+    except OSError as e:
+        # 6112 UDP는 게임/ipxwrapper가 이미 점유했을 수 있다.
+        # 감청 실패는 치명적이지 않으므로 로그만 남긴다.
+        print(f"UDP bind FAILED port={port}: {e}")
+        return
 
     print(f"UDP listening on port {port}")
 
     while True:
-        data, addr = server.recvfrom(4096)
-        print()
-        print(f"[{now()}] UDP {addr} port={port} {len(data)}B: {data[:32].hex(' ')}")
+        data, addr = server.recvfrom(8192)
+        print(
+            f"\n[{now()}] UDP {addr} port={port} {len(data)}B\n"
+            f"  HEX : {data[:96].hex(' ')}" + (" ..." if len(data) > 96 else "") + "\n"
+            f"  TEXT: {decode_text(data[:96])}"
+        )
 
 
 def main():
