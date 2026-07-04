@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.5"
+SERVER_VERSION = "1.6"
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000, 6112]
@@ -458,10 +458,17 @@ def push_user_joined_to_lobby(new_user, except_conn):
 
 
 def broadcast_room_list_to_lobby(except_conn=None):
-    """Push room list to all lobby-state clients (except_conn 제외).
+    """방 목록을 로비 클라이언트에게 push하려던 함수 — 현재 비활성화.
 
-    유저 목록(0x1FFF)은 보내지 않는다 — 클라이언트가 APPEND해서 무한 증가.
+    방 엔트리는 0x0BFF로 보내야 하는데(GS 디스패처 역분석), 요청받지 않은
+    0x0BFF를 로비 클라이언트에 push하면 채널 조인 상태로 오인해 멈출 위험이
+    있다. 따라서 방 목록은 클라이언트가 0x0BFF로 직접 요청(참전 버튼)할 때만
+    내려준다. 실시간 방 목록 갱신이 필요하면 안전한 방식을 별도로 설계한다.
     """
+    return
+
+
+def _broadcast_room_list_to_lobby_disabled(except_conn=None):
     remove_stale_rooms()
     with lock:
         room_snapshot = [dict(room) for room in rooms]
@@ -597,22 +604,22 @@ def make_room_list_record(room):
 
 
 def make_room_list_packets(room_snapshot):
-    if not room_snapshot:
-        return make_empty_room_list_packets()
-
+    # KAURI.dll GS 디스패처(SN_HandleGSPacket) 역분석 결과 방 목록 프로토콜:
+    #   0x0CFF = 목록 시작 (클라이언트 리스트 클리어)
+    #   0x0BFF = 방 엔트리   (엔트리 파서 0x10050f77이 읽어 리스트에 추가)
+    #   0x0DFF = 목록 끝     (화면 갱신/refresh)
+    # 이전에는 방 데이터를 0x0DFF에 넣었는데, 0x0DFF는 '끝(갱신)' 핸들러라
+    # 데이터를 무시하고 빈 리스트를 그렸다(방이 안 보이는 근본 원인).
+    # 방 데이터는 반드시 0x0BFF에 담아야 한다.
     list_body = b""
-
     for room in room_snapshot:
         list_body += make_room_list_record(room)
 
-    if not list_body:
-        return make_empty_room_list_packets()
-
-    return [
-        make_packet(0x0CFF, b""),
-        make_packet(0x0DFF, list_body),
-        make_packet(0x0DFF, b""),
-    ]
+    packets = [make_packet(0x0CFF, b"")]
+    if list_body:
+        packets.append(make_packet(0x0BFF, list_body))
+    packets.append(make_packet(0x0DFF, b""))
+    return packets
 
 
 def remove_stale_rooms():
@@ -695,6 +702,13 @@ def notify_room_host_player_left(leaving_user, host_info):
     if not host_info:
         print(f"[HOST NOTIFY] {leaving_user} 의 호스트 없음 (방에 없거나 이미 나감)")
         return
+
+    # 방 목록(0x0BFF 엔트리)을 요청받지 않은 상태의 호스트에게 push하면
+    # 채널 조인 상태로 오인해 멈출 위험이 있어 비활성화한다. 호스트는
+    # 참전 목록을 다시 열면(0x0BFF 요청) 최신 상태를 받는다.
+    print(f"[HOST NOTIFY] {leaving_user} 퇴장 — 방 목록 push 생략(안전)")
+    return
+
     host_conn, host_addr, host_user = host_info
     host_cid = get_conn_id(host_conn)
 
@@ -922,16 +936,17 @@ def get_responses(conn, addr, packet_type, body):
     # (0x0BFF 방목록 버튼 응답에는 유저 목록을 넣지 않음).
     if packet_type == 0x07FF:
         branch = "post-room-exit" if len(body) <= 1 else "login-after"
-        print(f"[ACCT_INFO] [{conn_id}|{user}] body_len={len(body)} → {branch}: 유저/방 목록 전송")
+        print(f"[ACCT_INFO] [{conn_id}|{user}] body_len={len(body)} → {branch}: 유저 목록 전송")
 
-        remove_stale_rooms()
-        with lock:
-            room_snapshot_07 = [dict(room) for room in rooms]
+        # 유저 목록만 보낸다. 방 엔트리(0x0BFF)는 요청받지 않은 상태에서 보내면
+        # 로비 클라이언트가 채널 조인 상태로 오인해 멈출 수 있으므로,
+        # 방 목록은 클라이언트가 0x0BFF로 직접 요청할 때만 내려준다.
+        # 여기서는 빈 방 목록(클리어+갱신)만 보내 로비 상태를 정돈한다.
         active_users_07 = get_active_users()
         return (
             [make_packet(0x07FF, b"\x00\x00")]
             + make_channel_user_list_packets(active_users_07)
-            + make_room_list_packets(room_snapshot_07)
+            + make_empty_room_list_packets()
         )
 
     # 방 목록 요청 (클라이언트→서버: 0x0BFF)
@@ -1122,6 +1137,17 @@ def get_responses(conn, addr, packet_type, body):
             [make_packet(0x24FF, b"\x00\x00")]
             + make_lobby_rejoin_packets()
         )
+
+    # 전적/순위(랭킹) 목록 요청. 클라이언트는 0x15FF로 랭킹을 요청한다.
+    # KAURI.dll 랭킹 파서(0x10051547) 역분석:
+    #   idx=5 에서 시작, idx < 패킷size 인 동안 엔트리(22바이트+)를 읽는다.
+    #   size <= 5 이면 "CNT 0"(빈 랭킹)로 안전하게 끝난다.
+    # 기본 응답(size=6, body=\x00\x00)을 주면 5 < 6 이라 엔트리가 있다고 보고
+    # 1바이트뿐인 버퍼에서 22바이트를 읽어 strcat이 폭주 → 크래시한다.
+    # size=5(body 1바이트)로 응답하면 5 < 5 가 거짓이라 빈 랭킹으로 안전 처리된다.
+    if packet_type == 0x15FF:
+        print(f"[RANK LIST REQ] [{conn_id}|{user}] → 빈 랭킹(CNT 0) 응답")
+        return [make_packet(0x15FF, b"\x00")]
 
     print(f"[UNHANDLED] [{conn_id}|{user}] {plabel(packet_type)}")
     return [make_packet(packet_type, b"\x00\x00")]
