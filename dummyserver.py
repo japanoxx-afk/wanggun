@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.2"
+SERVER_VERSION = "1.3"
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000, 6112]
@@ -837,40 +837,40 @@ def get_responses(conn, addr, packet_type, body):
             print(f"[LOGIN OK] [{conn_id}] id={user_id} addr={addr}")
             print_state("LOGIN")
 
-            remove_stale_rooms()
-            with lock:
-                room_snapshot_login = [dict(room) for room in rooms]
-            active_users_login = get_active_users()
+            # 로그인 응답에는 채널 조인(0x09/0x0A/0x0B)만 보낸다.
+            # 유저/방 목록을 여기서 같이 묶어 보내면 클라이언트가 채널 조인과
+            # 한 덩어리로 받아 유저 목록을 화면에 반영하지 못한다(로그인 시
+            # 참전장수 목록이 비어 보이는 원인). 목록은 클라이언트가 채널 조인
+            # 후 보내는 0x07FF 응답에서 따로 내려준다 — 이는 방 나간 후 흐름과
+            # 동일하며, 그 흐름에선 목록이 정상 표시된다.
             return (
                 [make_packet(0x05FF, b"\x00\x00")]
                 + make_lobby_rejoin_packets()
-                + make_channel_user_list_packets(active_users_login)
-                + make_room_list_packets(room_snapshot_login)
             )
 
         print(f"[LOGIN FAILED] [{conn_id}] invalid body")
         return [make_packet(0x05FF, b"\x04\x00")]
 
     # 계정 / 닉네임 정보
-    # · 로그인 직후: body = 게임이름(太祖王建, 9+ bytes) → 목록 중복 방지로 ACK만
-    # · 방 나가기 후: body = \x00 (1 byte) → 유저/방 목록 내려줌
+    # 클라이언트는 채널 조인(0x09/0x0A/0x0B) 수신 후 0x07FF를 보낸다.
+    #   · 로그인 직후: body = 게임이름(太祖王建, 9+ bytes)
+    #   · 방 나가기 후: body = \x00 (1 byte)
+    # 두 경우 모두 방금 채널에 (재)진입한 상태이므로 유저/방 목록을 내려준다.
+    # 유저 목록(0x1FFF)은 이 시점에만 보내므로 append로 쌓이지 않는다
+    # (0x0BFF 방목록 버튼 응답에는 유저 목록을 넣지 않음).
     if packet_type == 0x07FF:
-        print(f"[ACCT_INFO] [{conn_id}|{user}] body_len={len(body)}")
+        branch = "post-room-exit" if len(body) <= 1 else "login-after"
+        print(f"[ACCT_INFO] [{conn_id}|{user}] body_len={len(body)} → {branch}: 유저/방 목록 전송")
 
-        if len(body) <= 1:
-            print(f"  → post-room-exit 분기: 유저/방 목록 전송")
-            remove_stale_rooms()
-            with lock:
-                room_snapshot_07 = [dict(room) for room in rooms]
-            active_users_07 = get_active_users()
-            return (
-                [make_packet(0x07FF, b"\x00\x00")]
-                + make_channel_user_list_packets(active_users_07)
-                + make_room_list_packets(room_snapshot_07)
-            )
-
-        print(f"  → login-after 분기: ACK만")
-        return [make_packet(0x07FF, b"\x00\x00")]
+        remove_stale_rooms()
+        with lock:
+            room_snapshot_07 = [dict(room) for room in rooms]
+        active_users_07 = get_active_users()
+        return (
+            [make_packet(0x07FF, b"\x00\x00")]
+            + make_channel_user_list_packets(active_users_07)
+            + make_room_list_packets(room_snapshot_07)
+        )
 
     # 방 목록 요청 (클라이언트→서버: 0x0BFF)
     # 주의: 서버→클라이언트의 0x0BFF는 채널 재조인 신호 — 의미가 다르다.
