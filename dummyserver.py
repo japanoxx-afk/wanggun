@@ -8,6 +8,10 @@ import sys
 import traceback
 import weakref
 
+# 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
+# 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
+SERVER_VERSION = "1.1"
+
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000, 6112]
 # 방 정보 body가 1024를 넘는 경우 정상 패킷이 '깨진 헤더'로 오인되어
@@ -1245,7 +1249,8 @@ def main():
     ensure_default_accounts()
 
     print("=" * 60)
-    print("태조왕건 더미서버 시작. Enter 키로 종료.")
+    print(f"태조왕건 더미서버 v{SERVER_VERSION} 시작. Enter 키로 종료.")
+    print("※ 로그 첫 줄에 이 버전이 없으면 구버전 서버가 실행된 것입니다.")
     print("채팅창에서 /status 입력 시 현재 세션/방 상태를 로그에 출력합니다.")
     print(f"방은 생성 후 {ROOM_TTL_SECONDS // 60}분 동안 유지됩니다.")
     print("=" * 60)

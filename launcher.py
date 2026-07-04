@@ -15,7 +15,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -50,6 +50,35 @@ def get_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def read_server_version(path_or_bytes):
+    """dummyserver.py에서 SERVER_VERSION 값을 읽는다. 없으면 None(구버전)."""
+    try:
+        if isinstance(path_or_bytes, bytes):
+            text = path_or_bytes.decode("utf-8", errors="ignore")
+        else:
+            with open(path_or_bytes, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        match = re.search(r'^SERVER_VERSION\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        return match.group(1) if match else None
+    except OSError:
+        return None
+
+
+def get_effective_server_script():
+    """서버 시작 시 실제로 실행될 dummyserver.py 경로를 반환.
+
+    run_server_mode()와 같은 우선순위: exe 옆 로컬 파일 → 내장 파일.
+    """
+    base = get_base_dir()
+    local = os.path.join(base, "dummyserver.py")
+    if os.path.isfile(local):
+        return local, "로컬(업데이트본)"
+    bundled = os.path.join(get_resource_dir(), "dummyserver.py")
+    if os.path.isfile(bundled):
+        return bundled, "exe 내장본"
+    return None, "없음"
 
 
 def get_resource_dir():
@@ -448,22 +477,29 @@ class App(tk.Tk):
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=16)
 
-        if getattr(sys, "frozen", False):
-            ttk.Label(frame, text="서버 내장 모드 (단일 exe)", foreground="green").pack(
-                anchor="w"
-            )
+        # 서버 시작 시 실제로 실행될 스크립트와 그 버전을 표시한다.
+        # 구버전(버전 표기 없음)이 실행될 상황이면 빨간색으로 경고.
+        self.server_ver_var = tk.StringVar()
+        self.server_ver_label = ttk.Label(frame, textvariable=self.server_ver_var)
+        self.server_ver_label.pack(anchor="w")
+        self._refresh_server_version()
+
+    def _refresh_server_version(self):
+        script, source = get_effective_server_script()
+        if script is None:
+            self.server_ver_var.set("※ dummyserver.py를 찾을 수 없습니다.")
+            self.server_ver_label.configure(foreground="red")
+            return
+
+        version = read_server_version(script)
+        if version:
+            self.server_ver_var.set(f"서버 스크립트: v{version} ({source})")
+            self.server_ver_label.configure(foreground="green")
         else:
-            script = os.path.join(self.base_dir, "dummyserver.py")
-            if os.path.isfile(script):
-                ttk.Label(frame, text="dummyserver.py 감지됨", foreground="green").pack(
-                    anchor="w"
-                )
-            else:
-                ttk.Label(
-                    frame,
-                    text="※ dummyserver.py를 같은 폴더에 넣어주세요.",
-                    foreground="gray",
-                ).pack(anchor="w")
+            self.server_ver_var.set(
+                f"서버 스크립트: 구버전 ({source}) — [서버 업데이트] 버튼을 눌러주세요!"
+            )
+            self.server_ver_label.configure(foreground="red")
 
     def _on_start(self):
         ok, msg = self.server.start()
@@ -500,10 +536,12 @@ class App(tk.Tk):
                 f.write(data)
 
             size_kb = len(data) / 1024
-            self.update_status_var.set(f"완료 ({size_kb:.0f}KB)")
+            new_ver = read_server_version(data) or "?"
+            self.update_status_var.set(f"완료 v{new_ver} ({size_kb:.0f}KB)")
+            self._refresh_server_version()
             messagebox.showinfo(
                 "업데이트",
-                f"dummyserver.py를 최신 버전으로 업데이트했습니다.\n"
+                f"dummyserver.py를 v{new_ver}(으)로 업데이트했습니다.\n"
                 f"({size_kb:.0f}KB 다운로드)\n\n"
                 f"서버가 실행 중이면 재시작해야 적용됩니다.",
             )
