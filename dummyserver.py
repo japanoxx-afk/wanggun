@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.3"
+SERVER_VERSION = "1.5"
 
 TCP_PORTS = [9000, 6112]
 UDP_PORTS = [9000, 6112]
@@ -426,6 +426,37 @@ def broadcast_chat(packet):
             print(f"[CHAT SEND FAIL] [{cid}|{uid}]: {e}")
 
 
+def push_user_joined_to_lobby(new_user, except_conn):
+    """새 유저가 로그인하면 기존 로비 클라이언트에게 그 유저를 증분 추가한다.
+
+    클라이언트의 유저 목록(0x1FFF)은 append 방식이다(전체 목록을 다시 보내면
+    쌓인다). 그래서 신규 유저 1명만 담은 showuser 패킷을 기존 클라이언트에게
+    보내 목록에 추가되게 한다. 신규 유저 자신은 자기 0x07FF 응답에서 전체
+    목록을 받으므로 제외한다.
+    """
+    with lock:
+        targets = [
+            (c["conn"], c.get("conn_id", "C???"), c.get("user_id", "?"))
+            for c in clients
+            if (
+                c.get("user_id") not in (None, "unknown", "", new_user)
+                and c["conn"] is not except_conn
+                and sessions.get(c.get("user_id", ""), {}).get("state", "lobby") == "lobby"
+            )
+        ]
+
+    if not targets:
+        return
+
+    pkt = b"".join(make_channel_user_list_packets([{"user_id": new_user}]))
+    for conn, cid, uid in targets:
+        try:
+            safe_send(conn, pkt)
+            print(f"[USER JOIN PUSH] → [{cid}|{uid}]: +{new_user}")
+        except OSError as e:
+            print(f"[USER JOIN PUSH FAIL] [{cid}|{uid}]: {e}")
+
+
 def broadcast_room_list_to_lobby(except_conn=None):
     """Push room list to all lobby-state clients (except_conn 제외).
 
@@ -517,28 +548,52 @@ def get_room_owner_from_body(room_body):
 
 
 def make_room_list_record(room):
-    """방 목록 레코드를 클라이언트의 native 형식으로 만든다.
+    """방 목록 레코드를 클라이언트의 방 목록 파서 형식으로 만든다.
 
-    이전에는 서버가 [flags:4][cur:2][max:2][detaillen:2][name][detail] 형태로
-    재구성했는데, 이는 클라이언트가 방 생성(0x0EFF) 시 보낸 원본 형식과
-    헤더가 2바이트 어긋난다. 클라이언트가 생성/목록에 같은 파서를 쓰면
-    레코드가 밀려 목록이 화면에 뜨지 않는다.
+    KAURI.dll의 방 목록 파서(ClientRoomPacket.cpp, VA 0x10050f77)를 역분석해
+    확인한 엔트리 구조:
+        [블록 B: 10바이트][방이름\\0][detail: B[8:10] 바이트]
+      · B[4:6] = 현재 인원,  B[6:8] = 최대 인원,  B[8:10] = detail 길이
+      · detail = [지하맵:1][타일셋:1][..][맵너비:2][맵높이:2][맵이름\\0][만든이\\0]
 
-    가장 안전한 방법은 클라이언트가 보낸 원본 body를 그대로 되돌려주는 것이다
-    (클라이언트가 직렬화했으니 역직렬화도 된다). 현재 인원수만 실제 값으로
-    갱신한다. body 구조: [status:2][현재인원:2][최대인원:2][detail길이:2][이름\0]...
+    클라이언트가 방 생성(0x0EFF) 시 보내는 원본 body는 헤더가 8바이트이고
+    방이름 뒤에 1바이트 구분자(0x00)가 붙는다:
+        [상태:2][현재:2][최대:2][detail길이:2][방이름\\0][0x00][detail]
+    이를 리스트 엔트리로 변환하려면:
+      · 10바이트 블록 B로 재구성(B[4:6]=현재, B[6:8]=최대, B[8:10]=detail길이)
+      · 방이름은 그대로, detail은 선행 구분자(0x00)를 제거해 이어붙인다.
+    이렇게 하면 파서가 방/인원/맵이름/만든이/맵크기를 정확히 읽고
+    다음 엔트리 오프셋도 정확히 맞아떨어진다(역분석 시뮬레이션 검증 완료).
     """
     room_body = room["body"]
     if len(room_body) < 9:
         print("[ROOM LIST SKIP] room body too short")
         return b""
 
-    # 현재 인원수를 실제 참가자 수로 갱신([2:4] 필드).
-    player_count = max(1, len(room.get("players", [])))
-    record = bytearray(room_body)
-    struct.pack_into("<H", record, 2, player_count)
+    room_name, room_detail = split_first_null(room_body[8:])
+    if not room_name or not room_detail:
+        print("[ROOM LIST SKIP] missing room name/detail")
+        return b""
 
-    return bytes(record)
+    # 방이름 뒤 선행 구분자(0x00)를 제거해 detail 길이를 맞춘다.
+    expected_detail_len = struct.unpack_from("<H", room_body, 6)[0]
+    if (
+        expected_detail_len > 0
+        and len(room_detail) == expected_detail_len + 1
+        and room_detail[:1] == b"\x00"
+    ):
+        room_detail = room_detail[1:]
+
+    max_players = max(2, struct.unpack_from("<H", room_body, 4)[0])
+    cur_players = max(1, len(room.get("players", [])))
+
+    # 10바이트 블록 B: [flags:4][현재:2][최대:2][detail길이:2]
+    return (
+        b"\x00\x00\x00\x00"
+        + struct.pack("<HHH", cur_players, max_players, len(room_detail))
+        + room_name
+        + room_detail
+    )
 
 
 def make_room_list_packets(room_snapshot):
@@ -836,6 +891,13 @@ def get_responses(conn, addr, packet_type, body):
             set_client_user(conn, user_id)
             print(f"[LOGIN OK] [{conn_id}] id={user_id} addr={addr}")
             print_state("LOGIN")
+
+            # 이미 로비에 있는 다른 클라이언트에게 이 신규 유저를 실시간 추가한다.
+            threading.Thread(
+                target=push_user_joined_to_lobby,
+                args=(user_id, conn),
+                daemon=True,
+            ).start()
 
             # 로그인 응답에는 채널 조인(0x09/0x0A/0x0B)만 보낸다.
             # 유저/방 목록을 여기서 같이 묶어 보내면 클라이언트가 채널 조인과
