@@ -19,10 +19,10 @@ STATE_DIR = os.path.join(
     "TaejoWanggeonDummyServer",
 )
 ACCOUNTS_FILE = os.path.join(STATE_DIR, "accounts.json")
-RUN_LOG_FILE = os.path.join(
-    BASE_DIR,
-    "dummyserver_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log",
-)
+# 로그는 LOCALAPPDATA 아래에 남긴다. 런처 exe에 내장돼 실행되면 BASE_DIR이
+# PyInstaller 임시 폴더가 되어 종료 시 로그가 함께 삭제되기 때문이다.
+LOG_DIR = os.path.join(STATE_DIR, "logs")
+LOG_KEEP_COUNT = 30  # 최근 30개만 보관, 나머지는 자동 삭제
 
 accounts = {}
 sessions = {}
@@ -102,19 +102,55 @@ class TeeOutput:
                     pass
 
 
-def setup_logging():
-    log_path = RUN_LOG_FILE
+def cleanup_old_logs():
+    """LOG_DIR에서 오래된 로그를 지워 최근 LOG_KEEP_COUNT개만 남긴다."""
     try:
-        log_file = open(log_path, "w", encoding="utf-8", buffering=1)
-    except OSError:
-        log_path = os.path.abspath(
-            "dummyserver_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
+        logs = sorted(
+            f for f in os.listdir(LOG_DIR)
+            if f.startswith("dummyserver_") and f.endswith(".log")
         )
-        log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+        for old in logs[:-LOG_KEEP_COUNT]:
+            try:
+                os.remove(os.path.join(LOG_DIR, old))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def setup_logging():
+    log_name = (
+        "dummyserver_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
+    )
+
+    # 1순위: LOCALAPPDATA\TaejoWanggeonDummyServer\logs (항상 유지되는 위치)
+    # 2순위: 스크립트 폴더  3순위: 현재 폴더
+    candidates = [
+        os.path.join(LOG_DIR, log_name),
+        os.path.join(BASE_DIR, log_name),
+        os.path.abspath(log_name),
+    ]
+
+    log_file = None
+    log_path = None
+    for candidate in candidates:
+        try:
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            log_file = open(candidate, "w", encoding="utf-8", buffering=1)
+            log_path = candidate
+            break
+        except OSError:
+            continue
+
+    if log_file is None:
+        print("[LOG FILE] 로그 파일을 열 수 없어 콘솔에만 출력합니다.")
+        return
 
     sys.stdout = TeeOutput(sys.stdout, log_file)
     sys.stderr = TeeOutput(sys.stderr, log_file)
     print(f"[LOG FILE] {log_path}")
+
+    cleanup_old_logs()
 
 
 def now():
