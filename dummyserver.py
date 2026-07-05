@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.7"
+SERVER_VERSION = "1.8"
 
 TCP_PORTS = [9000, 6112]
 # UDP 6112는 게임의 IPX/P2P 연결 포트다. 서버가 이 포트를 바인딩하면
@@ -269,6 +269,108 @@ def ensure_default_accounts():
     if changed:
         save_accounts()
         print("[ACCOUNTS DEFAULTS CREATED] user_a/user_b")
+
+
+# 전적 기본값. 점수는 1000점에서 시작한다.
+RANK_BASE_SCORE = 1000
+RANK_WIN_DELTA = 10
+RANK_LOSS_DELTA = 10
+RANK_MAX_ENTRIES = 20  # 클라이언트 순위 배열 크기(0x14)
+
+
+def get_stats(user_id):
+    """계정의 전적을 (점수, 승, 패, 무, dis)로 반환. 없으면 기본값."""
+    acc = accounts.get(user_id, {})
+    return (
+        int(acc.get("score", RANK_BASE_SCORE)),
+        int(acc.get("wins", 0)),
+        int(acc.get("losses", 0)),
+        int(acc.get("draws", 0)),
+        int(acc.get("dis", 0)),
+    )
+
+
+def record_game_result(user_id, result_code):
+    """게임 결과를 계정 전적에 반영한다. result_code: 1=승, 2=패, 3=무, 그외=dis.
+
+    클라이언트가 게임 종료 시 0x24FF로 자신의 결과를 보고한다.
+    """
+    if user_id == "unknown":
+        return
+
+    with lock:
+        acc = accounts.setdefault(user_id, {
+            "password": "", "created_at": now(), "addr": None,
+        })
+        acc.setdefault("score", RANK_BASE_SCORE)
+        for key in ("wins", "losses", "draws", "dis"):
+            acc.setdefault(key, 0)
+
+        if result_code == 1:      # 승
+            acc["wins"] += 1
+            acc["score"] += RANK_WIN_DELTA
+            label = "승"
+        elif result_code == 2:    # 패
+            acc["losses"] += 1
+            acc["score"] = max(0, acc["score"] - RANK_LOSS_DELTA)
+            label = "패"
+        elif result_code == 3:    # 무
+            acc["draws"] += 1
+            label = "무"
+        else:                     # 접속 종료(dis) = 패 처리
+            acc["dis"] += 1
+            acc["losses"] += 1
+            acc["score"] = max(0, acc["score"] - RANK_LOSS_DELTA)
+            label = "Dis"
+
+        score = acc["score"]
+        w, l, d = acc["wins"], acc["losses"], acc["draws"]
+
+    save_accounts()
+    print(f"[GAME RESULT] {user_id}: {label}  점수={score} {w}승 {l}패 {d}무")
+
+
+def make_rank_entry(user_id, score, wins, losses, draws, dis):
+    """순위 엔트리(클라이언트 파서 형식).
+
+    KAURI.dll 순위 파서(0x10051547) 역분석:
+      [점수:4][승:4][패:4][무:4][Dis:4][등급:2] + 이름\\0 + 문자열2\\0
+    """
+    struct22 = struct.pack("<IIIIIH", score, wins, losses, draws, dis, 0)
+    return struct22 + encode_text(user_id) + encode_text("")
+
+
+def make_rank_list_packets(sort_byte):
+    """순위 목록 응답: 0x16FF(시작) + 0x15FF(정렬+엔트리) + 0x17FF(끝).
+
+    전적이 있는 계정을 점수 내림차순으로 최대 20개 내려준다.
+    엔트리가 없으면 0x15FF는 sort 바이트만(size=5) 보내 안전하게 빈 목록 처리.
+    """
+    with lock:
+        ranked = [
+            (uid, *get_stats(uid))
+            for uid in accounts
+        ]
+    # 게임을 한 번이라도 한 계정만, 점수 내림차순.
+    ranked = [r for r in ranked if (r[2] + r[3] + r[4] + r[5]) > 0]
+    ranked.sort(key=lambda r: r[1], reverse=True)
+    ranked = ranked[:RANK_MAX_ENTRIES]
+
+    entries = b"".join(
+        make_rank_entry(uid, score, w, l, d, dis)
+        for uid, score, w, l, d, dis in ranked
+    )
+    body_15 = sort_byte + entries
+
+    print(f"[RANK LIST] 엔트리 {len(ranked)}개 전송")
+    for uid, score, w, l, d, dis in ranked:
+        print(f"  {uid}: 점수={score} {w}승 {l}패 {d}무 dis={dis}")
+
+    return [
+        make_packet(0x16FF, b""),
+        make_packet(0x15FF, body_15),
+        make_packet(0x17FF, b""),
+    ]
 
 
 def get_client(conn):
@@ -1125,8 +1227,12 @@ def get_responses(conn, addr, packet_type, body):
         return []
 
     if packet_type == 0x24FF:
-        print(f"[GAME REPORT] [{conn_id}|{user}]")
+        # 게임 결과 보고. 0x24FF body = [결과:1][word:2][dword:4][이름...]
+        # 결과코드: 1=승, 2=패, 3=무, 그외=dis. 보고자(conn 유저)의 전적을 갱신.
+        result_code = body[0] if len(body) >= 1 else 0
+        print(f"[GAME REPORT] [{conn_id}|{user}] result={result_code}")
         if user != "unknown":
+            record_game_result(user, result_code)
             leave_room_state(user)
             set_user_state(user, "lobby", None)
             print_state("GAME_REPORT")
@@ -1143,14 +1249,14 @@ def get_responses(conn, addr, packet_type, body):
 
     # 전적/순위(랭킹) 목록 요청. 클라이언트는 0x15FF로 랭킹을 요청한다.
     # KAURI.dll 랭킹 파서(0x10051547) 역분석:
-    #   idx=5 에서 시작, idx < 패킷size 인 동안 엔트리(22바이트+)를 읽는다.
-    #   size <= 5 이면 "CNT 0"(빈 랭킹)로 안전하게 끝난다.
-    # 기본 응답(size=6, body=\x00\x00)을 주면 5 < 6 이라 엔트리가 있다고 보고
-    # 1바이트뿐인 버퍼에서 22바이트를 읽어 strcat이 폭주 → 크래시한다.
-    # size=5(body 1바이트)로 응답하면 5 < 5 가 거짓이라 빈 랭킹으로 안전 처리된다.
+    #   packet[4]=정렬타입, idx=5부터 idx < 패킷size 인 동안 엔트리를 읽는다.
+    #   엔트리 = [점수:4][승:4][패:4][무:4][Dis:4][등급:2] + 이름\0 + 문자열2\0
+    # 응답 시퀀스: 0x16FF(시작) + 0x15FF(정렬+엔트리) + 0x17FF(끝).
+    # 엔트리가 없으면 0x15FF는 정렬 바이트만(size=5) 담겨 "CNT 0"로 안전 처리된다.
     if packet_type == 0x15FF:
-        print(f"[RANK LIST REQ] [{conn_id}|{user}] → 빈 랭킹(CNT 0) 응답")
-        return [make_packet(0x15FF, b"\x00")]
+        sort_byte = body[0:1] if body else b"\x00"
+        print(f"[RANK LIST REQ] [{conn_id}|{user}] sort={sort_byte.hex()}")
+        return make_rank_list_packets(sort_byte)
 
     print(f"[UNHANDLED] [{conn_id}|{user}] {plabel(packet_type)}")
     return [make_packet(packet_type, b"\x00\x00")]
