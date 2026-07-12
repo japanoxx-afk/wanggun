@@ -6,16 +6,19 @@
 """
 
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -400,6 +403,238 @@ class WindowModeManager:
         return True, f"{mode} ({width}x{height}) 적용 완료."
 
 
+# ═══════════════════════════════════════════════════════
+#  게임 패치 (비침습적: 게임 파일을 수정하지 않는다)
+# ═══════════════════════════════════════════════════════
+
+GAME_EXE_NAME = "wanggun.exe"
+# 바이너리 패치(2·3번)를 대비한 백업 대상 파일들.
+PATCH_TARGET_FILES = ["WangGun.exe", "KAURI.dll", "iCARUS.dll"]
+BACKUP_DIR_NAME = "_원본백업"
+
+
+def _proc_name(pid):
+    """pid의 실행 파일 이름(소문자)."""
+    if not pid:
+        return ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+    except OSError:
+        pass
+    finally:
+        k32.CloseHandle(h)
+    return ""
+
+
+def _find_game_hwnd(exe_name=GAME_EXE_NAME):
+    """실행 중인 게임의 최상위 창 HWND를 찾는다. 없으면 0."""
+    user32 = ctypes.windll.user32
+    result = {"hwnd": 0}
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if _proc_name(pid.value) == exe_name:
+            result["hwnd"] = hwnd
+            return False
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return result["hwnd"]
+
+
+class ImeFixHelper:
+    """게임 창이 포커스일 때 영문 입력을 강제해 한글 IME로 단축키가 막히는 문제를
+    해결한다. 게임 파일을 수정하지 않는 백그라운드 감시 스레드."""
+
+    def __init__(self, exe_name=GAME_EXE_NAME):
+        self.exe_name = exe_name.lower()
+        self._thread = None
+        self._stop = threading.Event()
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.running:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        user32 = ctypes.windll.user32
+        imm32 = ctypes.windll.imm32
+        user32.LoadKeyboardLayoutW.restype = ctypes.c_void_p
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+        ]
+        WM_INPUTLANGCHANGEREQUEST = 0x0050
+        KLF_ACTIVATE = 0x00000001
+        en_hkl = user32.LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)
+        while not self._stop.is_set():
+            try:
+                hwnd = user32.GetForegroundWindow()
+                if hwnd:
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if _proc_name(pid.value) == self.exe_name:
+                        # 게임 창을 영문 레이아웃으로 전환 + IME 컨텍스트 해제.
+                        user32.PostMessageW(
+                            hwnd, WM_INPUTLANGCHANGEREQUEST, 0, en_hkl or 0
+                        )
+                        imm32.ImmAssociateContextEx(hwnd, 0, 0)
+            except OSError:
+                pass
+            self._stop.wait(0.4)
+
+
+class TimerOverlay:
+    """게임 창 상단 중앙에 경과 시간을 표시하는 투명·클릭통과 오버레이."""
+
+    def __init__(self, master, exe_name=GAME_EXE_NAME):
+        self.master = master
+        self.exe_name = exe_name.lower()
+        self.win = None
+        self.label = None
+        self._start = 0.0
+        self._after = None
+
+    @property
+    def running(self):
+        return self.win is not None
+
+    def start(self):
+        if self.win:
+            return
+        self._start = time.time()
+        self.win = tk.Toplevel(self.master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="black")
+        try:
+            self.win.attributes("-transparentcolor", "black")
+        except tk.TclError:
+            pass
+        self.label = tk.Label(
+            self.win, text="00:00", fg="#FFD54A", bg="black",
+            font=("Consolas", 22, "bold"),
+        )
+        self.label.pack()
+        self.win.update_idletasks()
+        self._make_clickthrough()
+        self._tick()
+
+    def reset(self):
+        self._start = time.time()
+
+    def stop(self):
+        if self._after is not None:
+            try:
+                self.master.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+            self.win = None
+
+    def _make_clickthrough(self):
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = self.win.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            )
+        except OSError:
+            pass
+
+    def _tick(self):
+        if self.win is None:
+            return
+        try:
+            game = _find_game_hwnd(self.exe_name)
+            if game:
+                user32 = ctypes.windll.user32
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(game, ctypes.byref(rect)):
+                    w = self.win.winfo_width() or 90
+                    cx = rect.left + (rect.right - rect.left - w) // 2
+                    self.win.geometry(f"+{cx}+{rect.top + 6}")
+                    self.win.deiconify()
+            else:
+                # 게임 창이 없으면 숨긴다.
+                self.win.withdraw()
+            elapsed = int(time.time() - self._start)
+            self.label.config(text="%02d:%02d" % (elapsed // 60, elapsed % 60))
+        except tk.TclError:
+            return
+        self._after = self.master.after(250, self._tick)
+
+
+class GameFileBackup:
+    """게임 원본 파일 백업/복원 (2·3번 바이너리 패치용 롤백 프레임)."""
+
+    def __init__(self, game_dir):
+        self.game_dir = game_dir
+
+    def backup_dir(self):
+        return os.path.join(self.game_dir, BACKUP_DIR_NAME)
+
+    def has_backup(self):
+        bd = self.backup_dir()
+        return any(
+            os.path.isfile(os.path.join(bd, f)) for f in PATCH_TARGET_FILES
+        )
+
+    def backup(self):
+        bd = self.backup_dir()
+        os.makedirs(bd, exist_ok=True)
+        done = []
+        for f in PATCH_TARGET_FILES:
+            src = os.path.join(self.game_dir, f)
+            dst = os.path.join(bd, f)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                shutil.copy2(src, dst)
+                done.append(f)
+        return done
+
+    def restore(self):
+        bd = self.backup_dir()
+        done = []
+        for f in PATCH_TARGET_FILES:
+            src = os.path.join(bd, f)
+            dst = os.path.join(self.game_dir, f)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+                done.append(f)
+        return done
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -416,12 +651,20 @@ class App(tk.Tk):
         game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
         self.winmode = WindowModeManager(game_dir)
 
+        # 게임 패치 도우미 (비침습적)
+        self.ime_helper = ImeFixHelper()
+        self.timer_overlay = TimerOverlay(self)
+        self.backup = GameFileBackup(game_dir)
+
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._build_server_tab(notebook)
         self._build_client_tab(notebook)
         self._build_settings_tab(notebook)
+        self._build_patch_tab(notebook)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         launch_frame = ttk.Frame(self)
         launch_frame.pack(fill="x", padx=8, pady=(0, 10))
@@ -696,6 +939,143 @@ class App(tk.Tk):
 
     def _on_open_hosts(self):
         HostsManager.open_hosts_file()
+
+    # ── 게임 패치 탭 ─────────────────────────────────────
+    def _build_patch_tab(self, notebook):
+        frame = ttk.Frame(notebook, padding=16)
+        notebook.add(frame, text="  게임 패치  ")
+
+        ttk.Label(
+            frame,
+            text="게임 파일을 수정하지 않는 실시간 도우미입니다.\n"
+                 "끄면 즉시 원래대로 돌아갑니다 (롤백).",
+            foreground="gray", justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        # 1) 한영 단축키 수정
+        ime_frame = ttk.LabelFrame(
+            frame, text="① 한영 단축키 수정", padding=10
+        )
+        ime_frame.pack(fill="x", pady=(0, 10))
+        self.ime_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ime_frame,
+            text="게임 중 영문 입력 강제 (한글 IME로 단축키 막힘 방지)",
+            variable=self.ime_var, command=self._on_toggle_ime,
+        ).pack(anchor="w")
+        ttk.Label(
+            ime_frame,
+            text="※ 켜면 게임 창이 포커스일 때 자동으로 영문으로 전환됩니다.\n"
+                 "   게임 내 한글 채팅은 어려워지지만 단축키가 항상 동작합니다.",
+            foreground="gray", justify="left", font=("", 8),
+        ).pack(anchor="w", pady=(4, 0))
+
+        # 4) 게임 타이머
+        timer_frame = ttk.LabelFrame(
+            frame, text="④ 게임 타이머 (상단 중앙)", padding=10
+        )
+        timer_frame.pack(fill="x", pady=(0, 10))
+        self.timer_var = tk.BooleanVar(value=False)
+        row = ttk.Frame(timer_frame)
+        row.pack(fill="x")
+        ttk.Checkbutton(
+            row, text="경과 시간 오버레이 표시",
+            variable=self.timer_var, command=self._on_toggle_timer,
+        ).pack(side="left")
+        ttk.Button(row, text="타이머 리셋", command=self._on_reset_timer).pack(
+            side="right"
+        )
+        ttk.Label(
+            timer_frame,
+            text="※ 창모드에서 게임 창 위에 표시됩니다 (설정 탭에서 창모드 권장).",
+            foreground="gray", justify="left", font=("", 8),
+        ).pack(anchor="w", pady=(4, 0))
+
+        # 2·3) 조사 중 안내 + 백업/롤백
+        adv_frame = ttk.LabelFrame(
+            frame, text="② 건설 중 랠리 / ③ 유닛 스폰 위치 — 조사 중", padding=10
+        )
+        adv_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            adv_frame,
+            text="게임 엔진 내부 로직이라 바이너리 패치 타당성을 조사 중입니다.\n"
+                 "적용 시 아래 백업으로 언제든 원본 복원이 가능합니다.",
+            foreground="gray", justify="left", font=("", 8),
+        ).pack(anchor="w")
+        bk_row = ttk.Frame(adv_frame)
+        bk_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(
+            bk_row, text="원본 백업", command=self._on_backup, width=14
+        ).pack(side="left")
+        ttk.Button(
+            bk_row, text="롤백 (원본 복원)", command=self._on_rollback, width=18
+        ).pack(side="left", padx=(8, 0))
+        self.backup_status = tk.StringVar()
+        ttk.Label(
+            adv_frame, textvariable=self.backup_status, foreground="gray"
+        ).pack(anchor="w", pady=(4, 0))
+        self._refresh_backup_status()
+
+    def _on_toggle_ime(self):
+        if self.ime_var.get():
+            self.ime_helper.start()
+        else:
+            self.ime_helper.stop()
+
+    def _on_toggle_timer(self):
+        if self.timer_var.get():
+            self.timer_overlay.start()
+        else:
+            self.timer_overlay.stop()
+
+    def _on_reset_timer(self):
+        if self.timer_overlay.running:
+            self.timer_overlay.reset()
+        else:
+            self.timer_var.set(True)
+            self.timer_overlay.start()
+
+    def _refresh_backup_status(self):
+        self.backup.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        if self.backup.has_backup():
+            self.backup_status.set("원본 백업 있음 ✓")
+        else:
+            self.backup_status.set("원본 백업 없음")
+
+    def _on_backup(self):
+        self.backup.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        try:
+            done = self.backup.backup()
+        except OSError as e:
+            messagebox.showerror("백업 실패", str(e))
+            return
+        self._refresh_backup_status()
+        if done:
+            messagebox.showinfo("백업", f"백업 완료: {', '.join(done)}")
+        else:
+            messagebox.showinfo("백업", "이미 백업이 있거나 대상 파일이 없습니다.")
+
+    def _on_rollback(self):
+        self.backup.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        if not self.backup.has_backup():
+            messagebox.showinfo("롤백", "백업이 없습니다.")
+            return
+        if not messagebox.askyesno("롤백", "원본 파일로 복원하시겠습니까?"):
+            return
+        try:
+            done = self.backup.restore()
+        except OSError as e:
+            messagebox.showerror("롤백 실패", str(e))
+            return
+        messagebox.showinfo("롤백", f"원본 복원 완료: {', '.join(done)}")
+
+    def _on_close(self):
+        try:
+            self.ime_helper.stop()
+            self.timer_overlay.stop()
+        except Exception:
+            pass
+        self.destroy()
 
     def _on_launch_game(self):
         game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
