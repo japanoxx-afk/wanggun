@@ -18,7 +18,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.90003"
+APP_VERSION = "0.90004"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -521,6 +521,9 @@ class TimerOverlay:
         self.armed = False
         self._watch_after = None
         self._game_present = False
+        self._hotkey_vk = 0x91   # Scroll Lock: 전투 시작 시 타이머 0부터
+        self._hotkey_down = False
+        self._counting = False   # 핫키를 누르기 전에는 00:00에서 대기
 
     @property
     def running(self):
@@ -562,6 +565,7 @@ class TimerOverlay:
         if self.win:
             return
         self._start = time.time()
+        self._counting = False   # 전투 시작(핫키) 전에는 대기 상태
         self.win = tk.Toplevel(self.master)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -582,7 +586,9 @@ class TimerOverlay:
         self._tick()
 
     def reset(self):
+        # 전투 시작 시점: 0부터 카운트 시작.
         self._start = time.time()
+        self._counting = True
 
     def stop(self):
         if self._after is not None:
@@ -618,8 +624,18 @@ class TimerOverlay:
         if self.win is None:
             return
         try:
-            elapsed = int(time.time() - self._start)
-            self.label.config(text="%02d:%02d" % (elapsed // 60, elapsed % 60))
+            # 전투 시작 핫키(Scroll Lock) 감지 → 0부터 카운트 시작.
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(self._hotkey_vk) & 0x8000)
+            if down and not self._hotkey_down:
+                self.reset()
+            self._hotkey_down = down
+
+            if self._counting:
+                elapsed = int(time.time() - self._start)
+                self.label.config(text="%02d:%02d" % (elapsed // 60, elapsed % 60))
+            else:
+                # 전투 시작 전: 대기 표시
+                self.label.config(text="00:00")
             self.win.update_idletasks()
             game = _find_game_hwnd(self.exe_name)
             if game:
@@ -793,9 +809,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"태조왕건 서버 런처 v{APP_VERSION}")
-        self.geometry("520x580")
+        self.geometry("540x680")
         self.resizable(True, True)
-        self.minsize(460, 520)
+        self.minsize(480, 600)
 
         self.base_dir = get_base_dir()
         self.server = ServerManager(self.base_dir)
@@ -812,7 +828,6 @@ class App(tk.Tk):
         self.rally_patch = BinaryPatch(game_dir, **RALLY_PATCH)
 
         notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._build_server_tab(notebook)
         self._build_client_tab(notebook)
@@ -821,12 +836,15 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 게임 실행 버튼을 하단에 먼저 고정(항상 보이도록) → 그 위에 탭이 채워짐.
         launch_frame = ttk.Frame(self)
-        launch_frame.pack(fill="x", padx=8, pady=(0, 10))
+        launch_frame.pack(side="bottom", fill="x", padx=8, pady=(4, 10))
         ttk.Button(
-            launch_frame, text="게임 실행 (WangGun.exe)",
+            launch_frame, text="▶  게임 실행 (WangGun.exe)",
             command=self._on_launch_game,
-        ).pack(anchor="center")
+        ).pack(anchor="center", ipadx=8, ipady=6, fill="x")
+
+        notebook.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._update_status()
 
@@ -1135,16 +1153,17 @@ class App(tk.Tk):
         row = ttk.Frame(timer_frame)
         row.pack(fill="x")
         ttk.Checkbutton(
-            row, text="타이머 사용 (게임 실행 시 자동 시작)",
+            row, text="타이머 사용 (게임 창에 표시)",
             variable=self.timer_var, command=self._on_toggle_timer,
         ).pack(side="left")
-        ttk.Button(row, text="타이머 리셋", command=self._on_reset_timer).pack(
+        ttk.Button(row, text="지금 시작/리셋", command=self._on_reset_timer).pack(
             side="right"
         )
         ttk.Label(
             timer_frame,
-            text="※ 체크해 두면 게임 창이 뜰 때 자동으로 0부터 시작합니다.\n"
-                 "   전투 시작 시점에 맞추려면 '타이머 리셋'을 누르세요.\n"
+            text="※ 체크하면 게임 창 상단에 00:00으로 대기합니다.\n"
+                 "   전투가 시작되면 Scroll Lock 키를 누르세요 → 0부터 카운트.\n"
+                 "   (게임에 영향 없는 키. '지금 시작/리셋' 버튼도 동일 동작)\n"
                  "   창모드에서 잘 보입니다 (설정 탭에서 창모드 권장).",
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w", pady=(4, 0))
