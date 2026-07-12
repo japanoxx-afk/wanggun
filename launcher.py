@@ -18,7 +18,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.90001"
+APP_VERSION = "0.90002"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -526,14 +526,16 @@ class TimerOverlay:
         self.win = tk.Toplevel(self.master)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.configure(bg="black")
+        # 반투명 창(-alpha)으로 렌더링. -transparentcolor는 수동 layered 스타일과
+        # 충돌해 검은 박스만 나오고 글자가 안 보이는 문제가 있어 사용하지 않는다.
         try:
-            self.win.attributes("-transparentcolor", "black")
+            self.win.attributes("-alpha", 0.82)
         except tk.TclError:
             pass
+        self.win.configure(bg="#0d0d0d")
         self.label = tk.Label(
-            self.win, text="00:00", fg="#FFD54A", bg="black",
-            font=("Consolas", 22, "bold"),
+            self.win, text="00:00", fg="#FFD54A", bg="#0d0d0d",
+            font=("Consolas", 22, "bold"), padx=12, pady=2,
         )
         self.label.pack()
         self.win.update_idletasks()
@@ -558,17 +560,17 @@ class TimerOverlay:
             self.win = None
 
     def _make_clickthrough(self):
+        # -alpha가 이미 WS_EX_LAYERED를 켰으므로, 클릭 통과용 WS_EX_TRANSPARENT와
+        # 포커스 방지 WS_EX_NOACTIVATE만 기존 스타일에 추가한다.
         try:
             user32 = ctypes.windll.user32
-            hwnd = self.win.winfo_id()
+            hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
             GWL_EXSTYLE = -20
-            WS_EX_LAYERED = 0x00080000
             WS_EX_TRANSPARENT = 0x00000020
             WS_EX_NOACTIVATE = 0x08000000
             ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE,
-                ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
             )
         except OSError:
             pass
@@ -577,20 +579,20 @@ class TimerOverlay:
         if self.win is None:
             return
         try:
+            elapsed = int(time.time() - self._start)
+            self.label.config(text="%02d:%02d" % (elapsed // 60, elapsed % 60))
+            self.win.update_idletasks()
             game = _find_game_hwnd(self.exe_name)
             if game:
                 user32 = ctypes.windll.user32
                 rect = wintypes.RECT()
                 if user32.GetWindowRect(game, ctypes.byref(rect)):
-                    w = self.win.winfo_width() or 90
+                    w = max(self.win.winfo_reqwidth(), 60)
                     cx = rect.left + (rect.right - rect.left - w) // 2
                     self.win.geometry(f"+{cx}+{rect.top + 6}")
                     self.win.deiconify()
-            else:
-                # 게임 창이 없으면 숨긴다.
-                self.win.withdraw()
-            elapsed = int(time.time() - self._start)
-            self.label.config(text="%02d:%02d" % (elapsed // 60, elapsed % 60))
+                    self.win.attributes("-topmost", True)
+            # 게임 창을 못 찾아도 숨기지 않는다(탐지 실패 시 사라지는 문제 방지).
         except tk.TclError:
             return
         self._after = self.master.after(250, self._tick)
@@ -636,20 +638,18 @@ class GameFileBackup:
 
 
 class BinaryPatch:
-    """게임 실행 파일의 1바이트를 안전하게 패치/복원한다.
+    """게임 실행 파일의 여러 바이트 구간을 안전하게 패치/복원한다.
 
-    패치 대상 바이트를 사이에 두고 앞(prefix)·뒤(suffix) 고정 문맥으로 위치를
-    특정한다. 패치 후 대상 바이트가 바뀌어도 prefix/suffix는 그대로라 위치를
-    다시 찾을 수 있고, 조합이 유일할 때만 동작해 안전하다.
+    각 편집(edit)은 패치 구간을 앞(prefix)·뒤(suffix) 고정 문맥으로 특정한다.
+    패치 후 구간이 바뀌어도 prefix/suffix는 그대로라 위치를 다시 찾을 수 있고,
+    조합이 유일하며 구간이 orig/patched 중 하나일 때만 동작해 안전하다.
+    edit = dict(prefix=bytes, orig=bytes, patched=bytes, suffix=bytes)
     """
 
-    def __init__(self, game_dir, filename, prefix, suffix, orig, patched):
+    def __init__(self, game_dir, filename, edits):
         self.game_dir = game_dir
         self.filename = filename
-        self.prefix = prefix
-        self.suffix = suffix
-        self.orig = orig
-        self.patched = patched
+        self.edits = edits
 
     def _path(self):
         return os.path.join(self.game_dir, self.filename)
@@ -658,18 +658,22 @@ class BinaryPatch:
         with open(self._path(), "rb") as f:
             return f.read()
 
-    def _find(self, data):
-        """패치 대상 바이트의 위치. 유일하지 않으면 -2, 없으면 -1."""
+    def _find_edit(self, data, edit):
+        """편집 구간의 시작 위치. 유일하지 않으면 -2, 없으면 -1."""
+        prefix, suffix = edit["prefix"], edit["suffix"]
+        olen = len(edit["orig"])
+        plen = len(prefix)
         matches = []
         start = 0
-        plen = len(self.prefix)
         while True:
-            i = data.find(self.prefix, start)
+            i = data.find(prefix, start)
             if i < 0:
                 break
-            byte_pos = i + plen
-            if data[byte_pos + 1: byte_pos + 1 + len(self.suffix)] == self.suffix:
-                matches.append(byte_pos)
+            rpos = i + plen
+            region = data[rpos:rpos + olen]
+            if (region in (edit["orig"], edit["patched"])
+                    and data[rpos + olen: rpos + olen + len(suffix)] == suffix):
+                matches.append(rpos)
             start = i + 1
         if not matches:
             return -1
@@ -678,49 +682,71 @@ class BinaryPatch:
         return matches[0]
 
     def status(self):
-        """'applied' | 'original' | 'notfound' | 'ambiguous' | 'nofile'"""
+        """'applied' | 'original' | 'partial' | 'notfound' | 'ambiguous' | 'nofile'"""
         if not os.path.isfile(self._path()):
             return "nofile"
         data = self._read()
-        pos = self._find(data)
-        if pos == -1:
-            return "notfound"
-        if pos == -2:
-            return "ambiguous"
-        b = data[pos]
-        if b == self.patched:
+        states = []
+        for edit in self.edits:
+            pos = self._find_edit(data, edit)
+            if pos == -1:
+                return "notfound"
+            if pos == -2:
+                return "ambiguous"
+            region = data[pos:pos + len(edit["orig"])]
+            states.append("applied" if region == edit["patched"] else "original")
+        if all(s == "applied" for s in states):
             return "applied"
-        if b == self.orig:
+        if all(s == "original" for s in states):
             return "original"
-        return "notfound"
+        return "partial"
 
-    def _set(self, target_byte):
+    def _set(self, use_patched):
         data = bytearray(self._read())
-        pos = self._find(bytes(data))
-        if pos < 0:
-            raise RuntimeError("패치 위치를 찾을 수 없습니다 (버전 불일치?)")
-        data[pos] = target_byte
+        # 먼저 모든 편집 위치를 확인(하나라도 실패하면 파일을 건드리지 않음)
+        plan = []
+        for edit in self.edits:
+            pos = self._find_edit(bytes(data), edit)
+            if pos < 0:
+                raise RuntimeError("패치 위치를 찾을 수 없습니다 (버전 불일치?)")
+            plan.append((pos, edit))
+        for pos, edit in plan:
+            region = edit["patched"] if use_patched else edit["orig"]
+            data[pos:pos + len(region)] = region
         with open(self._path(), "wb") as f:
             f.write(bytes(data))
 
     def apply(self):
-        self._set(self.patched)
+        self._set(True)
 
     def revert(self):
-        self._set(self.orig)
+        self._set(False)
 
 
-# ② 건설 중 랠리포인트: 명령 그룹 필터(WangGun.exe)에서 건설 중
-# (state & 0xf000 == 0x1000) 유닛을 제외하는 분기를 jne→jmp로 바꿔,
-# 건설 중에도 유닛이 명령 그룹에 유지되어 랠리를 받도록 한다.
-# 역분석: 필터 0x409864~, 건설상태 설정 0x40a2b1(=0x100d), 시그니처 고유(0x987b).
-# prefix = `cmp cx,0x1000`, 패치 바이트 = jne(0x75)→jmp(0xEB),
-# suffix = `<jne off> dec word[ebp+0x857674] ; jmp` → 조합이 유일.
+# ② 건설 중 랠리포인트 (WangGun.exe 패치, 역분석 기반)
+# 랠리 설정 핸들러(0x40a640, waypoint[0] 좌표를 0x7eb58a에 저장)가 0x40a68d에서
+# 건설 중(state & 0x1000; 건설시작 0x40a2b1이 state=0x100d 설정)이면 명령을
+# 거부(jne 0x40ae0f)한다. 이 jne(6바이트)를 NOP으로 없애 건설 중에도 랠리를
+# 받게 한다. 아울러 명령 그룹 필터(0x409880)의 건설 제외 분기도 jne→jmp로
+# 풀어 건설 건물이 그룹에 남도록 한다.
 RALLY_PATCH = dict(
     filename="WangGun.exe",
-    prefix=bytes.fromhex("6681f90010"),                 # cmp cx, 0x1000
-    suffix=bytes.fromhex("0966ff8d74768500eb13"),        # 09 ; dec word[..] ; jmp
-    orig=0x75, patched=0xEB,
+    edits=[
+        # 랠리 설정 핸들러의 건설 게이트: jne 0x40ae0f → NOP×6
+        dict(
+            prefix=bytes.fromhex("250010000066 85c0".replace(" ", "")),  # and eax,0x1000; test ax,ax
+            orig=bytes.fromhex("0f857c070000"),                          # jne 0x40ae0f
+            patched=bytes.fromhex("909090909090"),                       # nop×6
+            suffix=bytes.fromhex("8b5c2428"),                            # mov ebx,[esp+0x28]
+        ),
+        # 명령 그룹 필터의 건설 제외 분기: jne(0x75) → jmp(0xEB)
+        dict(
+            prefix=bytes.fromhex("6681f90010"),                          # cmp cx,0x1000
+            orig=bytes.fromhex("75"),                                    # jne
+            patched=bytes.fromhex("eb"),                                 # jmp
+            suffix=bytes.fromhex("0966ff8d74768500eb13"),                # 09; dec word[..]; jmp
+        ),
+    ],
 )
 
 
@@ -1050,13 +1076,14 @@ class App(tk.Tk):
         self.ime_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             ime_frame,
-            text="게임 중 영문 입력 강제 (한글 IME로 단축키 막힘 방지)",
+            text="게임 중 영문 입력 강제 (임시방편)",
             variable=self.ime_var, command=self._on_toggle_ime,
         ).pack(anchor="w")
         ttk.Label(
             ime_frame,
-            text="※ 켜면 게임 창이 포커스일 때 자동으로 영문으로 전환됩니다.\n"
-                 "   게임 내 한글 채팅은 어려워지지만 단축키가 항상 동작합니다.",
+            text="※ 켜면 단축키는 항상 되지만 한글 채팅/치트가 막힙니다.\n"
+                 "   '한글 상태에서도 단축키가 되게' 하는 근본 패치는 게임의 키\n"
+                 "   입력 처리를 손봐야 해 조사 중입니다. 기본은 꺼짐.",
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1166,6 +1193,7 @@ class App(tk.Tk):
         msg = {
             "applied": "상태: 적용됨 ✓",
             "original": "상태: 미적용 (원본)",
+            "partial": "상태: 일부만 적용됨 — 체크하면 완전 적용됩니다",
             "notfound": "상태: 패치 지점 없음 (버전 불일치?)",
             "ambiguous": "상태: 시그니처 중복 — 안전상 미적용",
             "nofile": "상태: WangGun.exe 없음",
