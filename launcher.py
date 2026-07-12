@@ -18,7 +18,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.90002"
+APP_VERSION = "0.90003"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -505,7 +505,11 @@ class ImeFixHelper:
 
 
 class TimerOverlay:
-    """게임 창 상단 중앙에 경과 시간을 표시하는 투명·클릭통과 오버레이."""
+    """게임 창 상단 중앙에 경과 시간을 표시하는 투명·클릭통과 오버레이.
+
+    'arm'하면 게임 창이 나타날 때 자동으로 타이머가 뜨고(0부터), 게임 창이
+    사라지면 숨는다. 즉 게임을 실행하면 자동으로 타이머가 시작된다.
+    """
 
     def __init__(self, master, exe_name=GAME_EXE_NAME):
         self.master = master
@@ -514,10 +518,45 @@ class TimerOverlay:
         self.label = None
         self._start = 0.0
         self._after = None
+        self.armed = False
+        self._watch_after = None
+        self._game_present = False
 
     @property
     def running(self):
         return self.win is not None
+
+    def arm(self):
+        """자동 시작 활성화: 게임 창을 감시해 나타나면 타이머를 띄운다."""
+        self.armed = True
+        self._game_present = False
+        self._watch()
+
+    def disarm(self):
+        self.armed = False
+        if self._watch_after is not None:
+            try:
+                self.master.after_cancel(self._watch_after)
+            except tk.TclError:
+                pass
+            self._watch_after = None
+        self.stop()
+
+    def _watch(self):
+        if not self.armed:
+            return
+        try:
+            present = bool(_find_game_hwnd(self.exe_name))
+            if present and not self._game_present:
+                # 게임 창 등장 → 타이머 새로 시작(0부터)
+                self.stop()
+                self.start()
+            elif not present and self._game_present:
+                self.stop()
+            self._game_present = present
+        except Exception:
+            pass
+        self._watch_after = self.master.after(1000, self._watch)
 
     def start(self):
         if self.win:
@@ -1096,7 +1135,7 @@ class App(tk.Tk):
         row = ttk.Frame(timer_frame)
         row.pack(fill="x")
         ttk.Checkbutton(
-            row, text="경과 시간 오버레이 표시",
+            row, text="타이머 사용 (게임 실행 시 자동 시작)",
             variable=self.timer_var, command=self._on_toggle_timer,
         ).pack(side="left")
         ttk.Button(row, text="타이머 리셋", command=self._on_reset_timer).pack(
@@ -1104,7 +1143,9 @@ class App(tk.Tk):
         )
         ttk.Label(
             timer_frame,
-            text="※ 창모드에서 게임 창 위에 표시됩니다 (설정 탭에서 창모드 권장).",
+            text="※ 체크해 두면 게임 창이 뜰 때 자동으로 0부터 시작합니다.\n"
+                 "   전투 시작 시점에 맞추려면 '타이머 리셋'을 누르세요.\n"
+                 "   창모드에서 잘 보입니다 (설정 탭에서 창모드 권장).",
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1126,8 +1167,10 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(2, 0))
         ttk.Label(
             rally_frame,
-            text="※ 적용 전 WangGun.exe를 자동 백업합니다. 체크 해제 시 원복.\n"
-                 "   게임이 실행 중이면 종료 후 적용하세요.",
+            text="※ 아직 조사 중인 기능입니다. 명령 실행부 2곳을 패치했으나\n"
+                 "   실제로는 적용되지 않는 것으로 확인돼(게이트가 입력 처리\n"
+                 "   쪽으로 추정) 추가 분석이 필요합니다. 적용 전 자동 백업하며\n"
+                 "   체크 해제 시 원복됩니다.",
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w", pady=(2, 0))
 
@@ -1169,16 +1212,18 @@ class App(tk.Tk):
 
     def _on_toggle_timer(self):
         if self.timer_var.get():
-            self.timer_overlay.start()
+            # 게임 실행 시 자동으로 타이머가 뜨도록 감시 시작.
+            self.timer_overlay.arm()
+            # 이미 게임이 실행 중이면 즉시 표시.
+            if _find_game_hwnd(self.timer_overlay.exe_name):
+                self.timer_overlay.stop()
+                self.timer_overlay.start()
         else:
-            self.timer_overlay.stop()
+            self.timer_overlay.disarm()
 
     def _on_reset_timer(self):
         if self.timer_overlay.running:
             self.timer_overlay.reset()
-        else:
-            self.timer_var.set(True)
-            self.timer_overlay.start()
 
     def _refresh_backup_status(self):
         self.backup.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
@@ -1255,7 +1300,7 @@ class App(tk.Tk):
     def _on_close(self):
         try:
             self.ime_helper.stop()
-            self.timer_overlay.stop()
+            self.timer_overlay.disarm()
         except Exception:
             pass
         self.destroy()
