@@ -18,7 +18,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_VERSION = "0.9"
+APP_VERSION = "0.90001"
 
 DEFAULT_DOMAINS = [
     "wanggun.trigger.co.kr",
@@ -635,6 +635,95 @@ class GameFileBackup:
         return done
 
 
+class BinaryPatch:
+    """게임 실행 파일의 1바이트를 안전하게 패치/복원한다.
+
+    패치 대상 바이트를 사이에 두고 앞(prefix)·뒤(suffix) 고정 문맥으로 위치를
+    특정한다. 패치 후 대상 바이트가 바뀌어도 prefix/suffix는 그대로라 위치를
+    다시 찾을 수 있고, 조합이 유일할 때만 동작해 안전하다.
+    """
+
+    def __init__(self, game_dir, filename, prefix, suffix, orig, patched):
+        self.game_dir = game_dir
+        self.filename = filename
+        self.prefix = prefix
+        self.suffix = suffix
+        self.orig = orig
+        self.patched = patched
+
+    def _path(self):
+        return os.path.join(self.game_dir, self.filename)
+
+    def _read(self):
+        with open(self._path(), "rb") as f:
+            return f.read()
+
+    def _find(self, data):
+        """패치 대상 바이트의 위치. 유일하지 않으면 -2, 없으면 -1."""
+        matches = []
+        start = 0
+        plen = len(self.prefix)
+        while True:
+            i = data.find(self.prefix, start)
+            if i < 0:
+                break
+            byte_pos = i + plen
+            if data[byte_pos + 1: byte_pos + 1 + len(self.suffix)] == self.suffix:
+                matches.append(byte_pos)
+            start = i + 1
+        if not matches:
+            return -1
+        if len(matches) > 1:
+            return -2
+        return matches[0]
+
+    def status(self):
+        """'applied' | 'original' | 'notfound' | 'ambiguous' | 'nofile'"""
+        if not os.path.isfile(self._path()):
+            return "nofile"
+        data = self._read()
+        pos = self._find(data)
+        if pos == -1:
+            return "notfound"
+        if pos == -2:
+            return "ambiguous"
+        b = data[pos]
+        if b == self.patched:
+            return "applied"
+        if b == self.orig:
+            return "original"
+        return "notfound"
+
+    def _set(self, target_byte):
+        data = bytearray(self._read())
+        pos = self._find(bytes(data))
+        if pos < 0:
+            raise RuntimeError("패치 위치를 찾을 수 없습니다 (버전 불일치?)")
+        data[pos] = target_byte
+        with open(self._path(), "wb") as f:
+            f.write(bytes(data))
+
+    def apply(self):
+        self._set(self.patched)
+
+    def revert(self):
+        self._set(self.orig)
+
+
+# ② 건설 중 랠리포인트: 명령 그룹 필터(WangGun.exe)에서 건설 중
+# (state & 0xf000 == 0x1000) 유닛을 제외하는 분기를 jne→jmp로 바꿔,
+# 건설 중에도 유닛이 명령 그룹에 유지되어 랠리를 받도록 한다.
+# 역분석: 필터 0x409864~, 건설상태 설정 0x40a2b1(=0x100d), 시그니처 고유(0x987b).
+# prefix = `cmp cx,0x1000`, 패치 바이트 = jne(0x75)→jmp(0xEB),
+# suffix = `<jne off> dec word[ebp+0x857674] ; jmp` → 조합이 유일.
+RALLY_PATCH = dict(
+    filename="WangGun.exe",
+    prefix=bytes.fromhex("6681f90010"),                 # cmp cx, 0x1000
+    suffix=bytes.fromhex("0966ff8d74768500eb13"),        # 09 ; dec word[..] ; jmp
+    orig=0x75, patched=0xEB,
+)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -655,6 +744,7 @@ class App(tk.Tk):
         self.ime_helper = ImeFixHelper()
         self.timer_overlay = TimerOverlay(self)
         self.backup = GameFileBackup(game_dir)
+        self.rally_patch = BinaryPatch(game_dir, **RALLY_PATCH)
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
@@ -991,19 +1081,46 @@ class App(tk.Tk):
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w", pady=(4, 0))
 
-        # 2·3) 조사 중 안내 + 백업/롤백
-        adv_frame = ttk.LabelFrame(
-            frame, text="② 건설 중 랠리 / ③ 유닛 스폰 위치 — 조사 중", padding=10
+        # ② 건설 중 랠리포인트 (바이너리 패치)
+        rally_frame = ttk.LabelFrame(
+            frame, text="② 건설 중 랠리포인트 (실험적 · WangGun.exe 패치)", padding=10
         )
-        adv_frame.pack(fill="x", pady=(0, 10))
+        rally_frame.pack(fill="x", pady=(0, 10))
+        self.rally_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            rally_frame,
+            text="건설 중인 건물에도 랠리포인트 지정 허용",
+            variable=self.rally_var, command=self._on_toggle_rally,
+        ).pack(anchor="w")
+        self.rally_status = tk.StringVar()
         ttk.Label(
-            adv_frame,
-            text="게임 엔진 내부 로직이라 바이너리 패치 타당성을 조사 중입니다.\n"
-                 "적용 시 아래 백업으로 언제든 원본 복원이 가능합니다.",
+            rally_frame, textvariable=self.rally_status, foreground="gray",
+            font=("", 8),
+        ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(
+            rally_frame,
+            text="※ 적용 전 WangGun.exe를 자동 백업합니다. 체크 해제 시 원복.\n"
+                 "   게임이 실행 중이면 종료 후 적용하세요.",
+            foreground="gray", justify="left", font=("", 8),
+        ).pack(anchor="w", pady=(2, 0))
+
+        # ③ 유닛 스폰 위치 — 조사 결과
+        spawn_frame = ttk.LabelFrame(
+            frame, text="③ 유닛 스폰을 랠리 최근접으로 — 조사 결과", padding=10
+        )
+        spawn_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            spawn_frame,
+            text="스폰 위치 선택은 조건 하나가 아니라 알고리즘 재작성(코드 주입)이\n"
+                 "필요해 바이너리 패치로는 위험이 큽니다. 현재는 비권장입니다.",
             foreground="gray", justify="left", font=("", 8),
         ).pack(anchor="w")
-        bk_row = ttk.Frame(adv_frame)
-        bk_row.pack(fill="x", pady=(6, 0))
+
+        # 원본 백업/롤백 (전체)
+        bk_frame = ttk.LabelFrame(frame, text="원본 백업 / 롤백", padding=10)
+        bk_frame.pack(fill="x")
+        bk_row = ttk.Frame(bk_frame)
+        bk_row.pack(fill="x")
         ttk.Button(
             bk_row, text="원본 백업", command=self._on_backup, width=14
         ).pack(side="left")
@@ -1012,9 +1129,10 @@ class App(tk.Tk):
         ).pack(side="left", padx=(8, 0))
         self.backup_status = tk.StringVar()
         ttk.Label(
-            adv_frame, textvariable=self.backup_status, foreground="gray"
+            bk_frame, textvariable=self.backup_status, foreground="gray"
         ).pack(anchor="w", pady=(4, 0))
         self._refresh_backup_status()
+        self._refresh_rally_status()
 
     def _on_toggle_ime(self):
         if self.ime_var.get():
@@ -1041,6 +1159,43 @@ class App(tk.Tk):
             self.backup_status.set("원본 백업 있음 ✓")
         else:
             self.backup_status.set("원본 백업 없음")
+
+    def _refresh_rally_status(self):
+        self.rally_patch.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        st = self.rally_patch.status()
+        msg = {
+            "applied": "상태: 적용됨 ✓",
+            "original": "상태: 미적용 (원본)",
+            "notfound": "상태: 패치 지점 없음 (버전 불일치?)",
+            "ambiguous": "상태: 시그니처 중복 — 안전상 미적용",
+            "nofile": "상태: WangGun.exe 없음",
+        }.get(st, st)
+        self.rally_status.set(msg)
+        self.rally_var.set(st == "applied")
+
+    def _on_toggle_rally(self):
+        self.rally_patch.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
+        want = self.rally_var.get()
+        st = self.rally_patch.status()
+        if st in ("notfound", "ambiguous", "nofile"):
+            messagebox.showerror("패치 불가", self.rally_status.get())
+            self._refresh_rally_status()
+            return
+        try:
+            if want:
+                # 적용 전 원본 자동 백업
+                self.backup.game_dir = self.rally_patch.game_dir
+                self.backup.backup()
+                self.rally_patch.apply()
+            else:
+                self.rally_patch.revert()
+        except (OSError, RuntimeError) as e:
+            messagebox.showerror(
+                "패치 실패",
+                f"{e}\n\n게임이 실행 중이면 종료 후 다시 시도하세요.",
+            )
+        self._refresh_backup_status()
+        self._refresh_rally_status()
 
     def _on_backup(self):
         self.backup.game_dir = self.cfg.get("game_dir", DEFAULT_GAME_DIR)
