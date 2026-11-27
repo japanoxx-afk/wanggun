@@ -6,11 +6,13 @@ import json
 import os
 import sys
 import traceback
+import uuid
 import weakref
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.9"
+SERVER_VERSION = "2.0"
 
 TCP_PORTS = [9000, 6112]
 # UDP 6112는 게임의 IPX/P2P 연결 포트다. 서버가 이 포트를 바인딩하면
@@ -29,6 +31,16 @@ STATE_DIR = os.environ.get("WANGGUN_DATA_DIR") or os.path.join(
     "TaejoWanggeonDummyServer",
 )
 ACCOUNTS_FILE = os.path.join(STATE_DIR, "accounts.json")
+# 경기 기록 — RTS ARENA 전적 사이트가 읽는다 (라크무·삼국지천명2 서버의 matches.json 과 같은 모양).
+MATCHES_FILE = os.path.join(STATE_DIR, "matches.json")
+# 전적·랭킹 JSON HTTP 포트 (/healthz, /matches.json, /ranking.json). 0 이면 끈다.
+HTTP_PORT = int(os.environ.get("WANGGUN_HTTP_PORT", "9010") or 0)
+# 1 이면 예전처럼 혼자 한 경기(사람 1명)도 게임 안 전적에 넣는다. 기본은 사람 2명 이상만.
+COUNT_SOLO_GAMES = os.environ.get("WANGGUN_COUNT_SOLO", "") == "1"
+# 같은 경기로 묶는 시간: 첫 결과 보고 후 이 시간 안에 온 같은 방 참가자의 보고를 같은 경기로 본다.
+MATCH_JOIN_SECONDS = 2 * 60 * 60
+# 방 참가자 명단을 기억하는 시간 (게임이 아주 길어도 명단을 잃지 않게 방 TTL 과 따로 둔다).
+GROUP_TTL_SECONDS = 6 * 60 * 60
 # 로그는 LOCALAPPDATA 아래에 남긴다. 런처 exe에 내장돼 실행되면 BASE_DIR이
 # PyInstaller 임시 폴더가 되어 종료 시 로그가 함께 삭제되기 때문이다.
 LOG_DIR = os.path.join(STATE_DIR, "logs")
@@ -299,6 +311,8 @@ def record_game_result(user_id, result_code):
     if user_id == "unknown":
         return
 
+    result_code &= 0x7F   # 0x80 = 래더(랭크) 표시 비트 (라크무와 같은 로비 프로토콜)
+
     with lock:
         acc = accounts.setdefault(user_id, {
             "password": "", "created_at": now(), "addr": None,
@@ -329,6 +343,221 @@ def record_game_result(user_id, result_code):
 
     save_accounts()
     print(f"[GAME RESULT] {user_id}: {label}  점수={score} {w}승 {l}패 {d}무")
+
+
+# ---------------------------------------------------------------- 경기 기록 (전적 사이트용)
+# 방 명단(groups): 방장 계정 -> {"players", "room", "started", "updated", "closed"}
+#   rooms 는 TTL(10분)·중복 정리로 게임 중에 사라질 수 있어, 경기 참가자 명단은 따로 기억한다.
+# 경기(matches): 첫 0x24FF 보고 때 그 방 명단으로 경기 1개를 만들고, 나머지 참가자의 보고를 같은 경기에 붙인다.
+#   matches.json 형식 (RTS ARENA arena/rakmu_server.py ServerRecord 가 그대로 읽는다):
+#   {"id", "time": 첫 결과 시각, "started": 방 생성 시각, "room", "map": "",
+#    "players": [계정...], "results": {계정: {"code": 1|2|3, "at": 시각, "dis"?: true}}}
+#   Dis(접속 종료 등 1~3 외 코드)는 게임 안 전적처럼 패(code 2)로 내보내고 "dis": true 를 붙인다.
+
+groups = {}
+matches = []
+pending_match = {}          # 계정 -> 경기 id (결과를 아직 안 보낸 참가자)
+matches_lock = threading.RLock()
+
+
+def _ts(t=None):
+    return (t or datetime.datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_matches():
+    global matches
+    try:
+        with open(MATCHES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            matches = data
+            print(f"[MATCHES LOADED] count={len(matches)} file={MATCHES_FILE}")
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        # 깨진 파일은 덮어쓰지 않고 옆에 보관한 뒤 새로 시작한다.
+        bad = MATCHES_FILE + ".bad-" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            os.replace(MATCHES_FILE, bad)
+        except OSError:
+            pass
+        print(f"[MATCHES LOAD FAILED] {e} → {bad}")
+
+
+def save_matches():
+    with matches_lock:
+        snapshot = json.dumps(matches, ensure_ascii=False, indent=1)
+    tmp_file = MATCHES_FILE + ".tmp"
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        os.replace(tmp_file, MATCHES_FILE)
+    except OSError as e:
+        print(f"[MATCHES SAVE FAILED] {e}")
+
+
+def _expire_groups(now_dt):
+    for creator in [c for c, g in groups.items()
+                    if (now_dt - g["updated"]).total_seconds() > GROUP_TTL_SECONDS]:
+        groups.pop(creator, None)
+
+
+def group_room_created(creator, room_name, map_name=""):
+    """방 생성/갱신. 같은 방장이 같은 방을 다시 알리면(방 정보 갱신·IPX 동기화) 참가자 명단을 유지한다."""
+    now_dt = datetime.datetime.now()
+    with matches_lock:
+        _expire_groups(now_dt)
+        g = groups.get(creator)
+        if g is None or g["closed"] or g["room"] != room_name:
+            # 새 방: 방장이 다른 열린 방에 참가자로 남아 있으면 빼낸다.
+            for other in groups.values():
+                if not other["closed"] and creator in other["players"]:
+                    other["players"].remove(creator)
+            groups[creator] = {"players": [creator], "room": room_name, "map": map_name,
+                               "started": now_dt, "updated": now_dt, "closed": False}
+        else:
+            g["updated"] = now_dt
+            if map_name:
+                g["map"] = map_name
+
+
+def group_player_joined(creator, user_id):
+    now_dt = datetime.datetime.now()
+    with matches_lock:
+        for c, other in groups.items():
+            if c != creator and not other["closed"] and user_id in other["players"]:
+                other["players"].remove(user_id)
+        g = groups.get(creator)
+        if g is None or g["closed"]:
+            g = groups[creator] = {"players": [creator], "room": "", "started": now_dt,
+                                   "updated": now_dt, "closed": False}
+        if user_id not in g["players"]:
+            g["players"].append(user_id)
+        g["updated"] = now_dt
+
+
+def group_player_left(user_id):
+    """게임 시작 전(결과 보고 전)에 방을 나가거나 접속이 끊긴 경우. 방장이면 방 명단을 닫는다."""
+    with matches_lock:
+        g = groups.get(user_id)
+        if g and not g["closed"]:
+            g["closed"] = True
+        for other in groups.values():
+            if not other["closed"] and user_id in other["players"]:
+                other["players"].remove(user_id)
+
+
+def _find_open_group(user_id):
+    for creator, g in groups.items():
+        if not g["closed"] and user_id in g["players"]:
+            return creator, g
+    return None, None
+
+
+def _match_by_id(match_id):
+    for m in reversed(matches):
+        if m.get("id") == match_id:
+            return m
+    return None
+
+
+def record_match_result(user_id, result_code):
+    """0x24FF 결과를 경기 기록에 넣는다. 반환: 그 경기의 사람 수 (게임 안 전적 반영 여부 판단용)."""
+    if user_id == "unknown":
+        return 0
+    now_dt = datetime.datetime.now()
+    code = result_code & 0x7F
+    entry = {"code": code if code in (1, 2, 3) else 2, "at": _ts(now_dt)}
+    if code not in (1, 2, 3):
+        entry["dis"] = True
+    if result_code & 0x80:
+        entry["code"] |= 0x80
+
+    with matches_lock:
+        match = None
+        mid = pending_match.pop(user_id, None)
+        if mid:
+            match = _match_by_id(mid)
+            if match:
+                started = datetime.datetime.strptime(match["time"], "%Y-%m-%d %H:%M:%S")
+                if (now_dt - started).total_seconds() > MATCH_JOIN_SECONDS:
+                    match = None
+        if match is None:
+            creator, g = _find_open_group(user_id)
+            if g is not None:
+                g["closed"] = True
+                players = list(dict.fromkeys(g["players"]))
+                room, map_name, started = g["room"], g.get("map", ""), g["started"]
+            else:
+                players, room, map_name, started = [user_id], "", "", now_dt
+            match = {"id": uuid.uuid4().hex[:16], "time": _ts(now_dt), "started": _ts(started),
+                     "room": room, "map": map_name, "players": players, "results": {}}
+            matches.append(match)
+            for p in players:
+                if p != user_id:
+                    pending_match[p] = match["id"]
+        if user_id not in match["players"]:
+            match["players"].append(user_id)
+        match["results"][user_id] = entry
+        n_players = len(match["players"])
+        mid = match["id"]
+
+    save_matches()
+    print(f"[MATCH] id={mid} players={n_players} {user_id} code={entry['code']}"
+          + (" (dis)" if entry.get("dis") else ""))
+    return n_players
+
+
+def ranking_rows():
+    """게임 안 랭킹(0x15FF)과 같은 값·순서."""
+    with lock:
+        rows = [(uid, *get_stats(uid)) for uid in accounts]
+    rows = [r for r in rows if (r[2] + r[3] + r[4] + r[5]) > 0]
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return [{"rank": i, "name": uid, "score": sc, "wins": w, "losses": l, "draws": d, "dis": dis}
+            for i, (uid, sc, w, l, d, dis) in enumerate(rows, 1)]
+
+
+class _StatsHandler(BaseHTTPRequestHandler):
+    def _json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
+            with lock:
+                n_sessions, n_rooms = len(sessions), len(rooms)
+            self._json({"ok": True, "version": SERVER_VERSION, "sessions": n_sessions,
+                        "rooms": n_rooms, "matches": len(matches)})
+        elif path == "/matches.json":
+            with matches_lock:
+                data = list(matches)
+            self._json(data)
+        elif path == "/ranking.json":
+            self._json(ranking_rows())
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def log_message(self, fmt, *args):   # 헬스체크가 로그를 채우지 않게
+        pass
+
+
+def start_http_server():
+    if not HTTP_PORT:
+        return
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _StatsHandler)
+    except OSError as e:
+        print(f"[HTTP] bind FAILED port={HTTP_PORT}: {e}")
+        return
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"전적/랭킹 HTTP on port {HTTP_PORT} (/healthz /matches.json /ranking.json)")
 
 
 def make_rank_entry(user_id, score, wins, losses, draws, dis):
@@ -653,6 +882,32 @@ def get_room_name_bytes(room_body):
 
 def get_room_name(room_body):
     return decode_text(get_room_name_bytes(room_body))
+
+
+def get_room_map_name(room_body):
+    """방 detail 의 맵 이름 (best-effort). detail = [지하맵][타일셋][..][너비:2][높이:2][맵이름\\0][만든이\\0].
+
+    맵 크기 바이트가 이름 앞에 붙어 읽힐 수 있어, 앞쪽 바이트를 하나씩 떼며 cp949 로 깨끗이 읽히는 이름을 찾는다.
+    못 찾으면 빈 값 (전적 사이트에 '맵 정보 없음').
+    """
+    if len(room_body) < 9:
+        return ""
+    _, room_detail = split_first_null(room_body[8:])
+    parts = [p for p in (room_detail or b"").split(b"\x00") if p]
+    if len(parts) < 2:
+        return ""
+    raw = parts[-2]
+    for skip in range(0, min(5, len(raw))):
+        chunk = raw[skip:]
+        if not chunk or chunk[0] < 0x20:
+            continue
+        try:
+            name = chunk.decode("cp949").strip()
+        except UnicodeDecodeError:
+            continue
+        if name and name.isprintable() and len(name) <= 64:
+            return name
+    return ""
 
 
 def get_room_owner_from_body(room_body):
@@ -1116,14 +1371,22 @@ def get_responses(conn, addr, packet_type, body):
             if owner_session and owner_session.get("addr"):
                 host_addr = owner_session["addr"]
 
+        # 같은 방장의 방 정보가 다시 오면(설정 변경·IPX 동기화) 기존 참가자 명단을 유지한다.
+        with lock:
+            prev_players = next(
+                (list(r["players"]) for r in rooms
+                 if r["creator"] == creator and get_room_name(r["body"]) == get_room_name(body)),
+                [creator],
+            )
         add_or_replace_room({
             "creator": creator,
             "session_user": creator,
             "addr": host_addr,
             "body": body,
             "created_at": datetime.datetime.now(),
-            "players": [creator],
+            "players": prev_players,
         })
+        group_room_created(creator, get_room_name(body), get_room_map_name(body))
         set_user_state(creator, "room", get_room_name(body))
 
         threading.Thread(
@@ -1166,6 +1429,8 @@ def get_responses(conn, addr, packet_type, body):
                     if user != "unknown" and user not in stored_room["players"]:
                         stored_room["players"].append(user)
                     if user != "unknown":
+                        group_player_joined(stored_room["creator"], user)
+                    if user != "unknown":
                         set_user_state(user, "room", get_room_name(stored_room["body"]))
                     break
 
@@ -1191,6 +1456,7 @@ def get_responses(conn, addr, packet_type, body):
                 daemon=True,
             ).start()
             remove_user_from_rooms(user)
+            group_player_left(user)
             set_user_state(user, "lobby", None)
             print_state("ROOM_EXIT")
 
@@ -1233,7 +1499,11 @@ def get_responses(conn, addr, packet_type, body):
         result_code = body[0] if len(body) >= 1 else 0
         print(f"[GAME REPORT] [{conn_id}|{user}] result={result_code}")
         if user != "unknown":
-            record_game_result(user, result_code)
+            n_players = record_match_result(user, result_code)
+            if n_players >= 2 or COUNT_SOLO_GAMES:
+                record_game_result(user, result_code)
+            else:
+                print(f"[GAME RESULT SKIP] {user}: 상대 플레이어 없는 경기 — 게임 안 전적에 넣지 않음")
             leave_room_state(user)
             set_user_state(user, "lobby", None)
             print_state("GAME_REPORT")
@@ -1308,6 +1578,7 @@ def cleanup_disconnect(conn, addr, port):
             daemon=True,
         ).start()
         leave_room_state(disconnected_user)
+        group_player_left(disconnected_user)
 
     with lock:
         for client in list(clients):
@@ -1437,6 +1708,7 @@ def main():
     setup_logging()
     load_accounts()
     ensure_default_accounts()
+    load_matches()
 
     print("=" * 60)
     print(f"태조왕건 더미서버 v{SERVER_VERSION} 시작. Enter 키로 종료.")
@@ -1444,6 +1716,8 @@ def main():
     print("채팅창에서 /status 입력 시 현재 세션/방 상태를 로그에 출력합니다.")
     print(f"방은 생성 후 {ROOM_TTL_SECONDS // 60}분 동안 유지됩니다.")
     print("=" * 60)
+
+    start_http_server()
 
     for port in UDP_PORTS:
         threading.Thread(target=udp_server, args=(port,), daemon=True).start()

@@ -1,0 +1,57 @@
+# 태조왕건 더미서버 — Portainer 스택 설정
+#
+# 라크무(rakmu-live)·삼국지천명2(samchun-live)·RTS ARENA 와 같은 방식: 이미지 빌드 없음.
+#   공개 이미지 python:3.12-slim 이 NAS 볼륨의 dummyserver.py 를 그대로 실행한다 (표준 라이브러리만 사용).
+#   코드:   game-servers/wanggun-live/app/dummyserver.py
+#   데이터: game-servers/wanggun-live/data/   (accounts.json = 계정·전적, matches.json = 전적 사이트용, logs/)
+#   → 코드 업데이트 = File Station 에서 app/dummyserver.py 교체 + 컨테이너 재시작.
+#
+# 포트 (게임 클라이언트가 번호를 고정해서 쓴다 — 바꿀 수 없다):
+#   TCP 6112  로비 (로그인·채팅·방·결과 보고)
+#   TCP 9000  인증/버전 확인
+#   UDP 9000  (게임이 보내는 UDP, 로그용)
+#   TCP 9010  전적·랭킹 JSON (/healthz /matches.json /ranking.json). RTS ARENA 는 파일을 직접 읽으므로 공유기에 열 필요 없음
+#
+# network_mode: host 를 쓰는 이유: 서버가 방장의 실제 IP 를 참가자에게 넘겨줘서 서로 직접(P2P) 접속하게 한다.
+# 포트 매핑(ports:)을 쓰면 접속자 IP 가 도커 게이트웨이 IP 로 보여 방 입장이 실패할 수 있다.
+
+name: wanggun
+
+services:
+  wanggun-server:
+    image: python:3.12-slim
+    container_name: wanggun-server
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /mnt/game-servers/wanggun-live/app
+    command: ["python", "-u", "dummyserver.py"]
+    environment:
+      TZ: Asia/Seoul                  # 전적 시각을 한국 시간으로 기록
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONIOENCODING: utf-8
+      WANGGUN_DATA_DIR: /mnt/game-servers/wanggun-live/data
+      WANGGUN_HTTP_PORT: "9010"
+    volumes:
+      # rakmu-live / samchun-live / rtsarena 스택과 같은 외부 볼륨 (File Station 의 game-servers 공유 폴더)
+      - game_servers_data:/mnt/game-servers
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 128                   # 접속 1명 = 스레드 1~2개
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9010/healthz',timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  game_servers_data:
+    external: true
