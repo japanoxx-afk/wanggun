@@ -1,0 +1,12 @@
+[LOG FILE] /home/claude/t/d2/logs/dummyserver_20261128_003130.log
+[ACCOUNTS DEFAULTS CREATED] user_a/user_b
+============================================================
+태조왕건 더미서버 v2.1 시작. Enter 키로 종료.
+※ 로그 첫 줄에 이 버전이 없으면 구버전 서버가 실행된 것입니다.
+채팅창에서 /status 입력 시 현재 세션/방 상태를 로그에 출력합니다.
+방은 생성 후 10분 동안 유지됩니다.
+============================================================
+전적/랭킹 HTTP on port 9010 (/healthz /matches.json /ranking.json)
+UDP listening on port 9000
+[PORT CONFLICT] TCP 9000 를 열 수 없습니다 — 다른 프로그램이 쓰는 중: [Errno 98] Address already in use
+TCP listening on port 6112

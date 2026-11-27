@@ -18,11 +18,30 @@
 | UDP **9000** | 게임이 보내는 UDP | **필요** (외부 9000 → VM 9000) |
 | TCP 9010 | 전적·랭킹 JSON (`/healthz`, `/matches.json`, `/ranking.json`) | 필요 없음 (확인용) |
 
-> **중요 1**: 게임은 6112/9000 번호를 고정해서 쓴다. 외부 포트와 VM 포트 번호가 **같아야** 한다.
-> 공유기는 30000~30999 만 VM 으로 전달하므로 **6112 TCP, 9000 TCP/UDP 전달 규칙을 공유기에 추가**해야 한다 (서버 관리자에게 요청).
+### 게임 서버 VM 전체 포트 (겹치지 않음 — 2026-11-28 각 저장소 compose 기준)
+
+| 스택 | 네트워크 | 쓰는 VM 포트 |
+|---|---|---|
+| rakmu (라크무) | 포트 매핑 | TCP 30010, TCP 30011, UDP 30012 |
+| rakmu-test | host | TCP 30000, TCP 30001, UDP 30002 |
+| samchun (삼국지천명2) | host | TCP 4800, TCP 4901, TCP 4902 |
+| rtsarena (전적 사이트) | 포트 매핑 | TCP 30013 |
+| **wanggun (태조왕건)** | host | **TCP 6112, TCP 9000, UDP 9000, TCP 9010** |
+| 사용 금지 | | 5001 (NAS 관리), 9443 (Portainer) |
+
+공유기 전달 규칙도 겹치지 않는다: 라크무 11223·11225, 삼국지천명2 4800·4901, 태조왕건 6112·9000.
+플레이어끼리 직접 연결(P2P)하는 포트(라크무 UDP 11223, 태조왕건 6112)는 각 플레이어 PC 쪽이라 NAS 와 무관하다.
+
+> **확인할 것 하나**: 9000 은 Portainer 의 옛 기본 HTTP 포트다. 지금 Portainer 는 9443 으로 쓰고 있지만,
+> 게임 서버 VM 안에서 Portainer 가 9000 도 열어 두었으면 태조왕건 서버만 9000 을 못 연다.
+> host 네트워크 컨테이너(samchun 등)의 포트는 Portainer 의 Published Ports 에 안 보이므로, **배포 후 healthz 로 확인**한다 (아래 3-5).
 >
-> **중요 2**: **9000 은 Portainer 의 기본 HTTP 포트**이기도 하다. 게임 서버 VM 에서 Portainer(또는 Portainer Agent 가 아닌 다른 것)가
-> 9000 을 쓰고 있으면 서버가 `TCP bind` 에 실패한다. 배포 전에 아래 3-2 에서 반드시 확인한다.
+> **기존 서버에는 영향 없음**: 이미 실행 중인 라크무·삼국지천명2 가 쓰는 포트는 새 컨테이너가 빼앗을 수 없다 (리눅스는 사용 중인 포트에
+> 두 번째 프로그램이 bind 하면 실패한다. 서버 2.1 은 UDP 도 포트 공유 옵션을 쓰지 않는다). 겹치면 **태조왕건 서버만** 그 포트를 못 열고
+> `[PORT CONFLICT]` 로그 + healthz `ok:false`(503) → Portainer 에 unhealthy 로 보인다. 이 스택을 배포·재시작해도 다른 스택은 재시작되지 않는다.
+>
+> 게임은 6112/9000 번호를 고정해서 쓰므로 외부 포트와 VM 포트 번호가 **같아야** 한다.
+> 공유기는 30000~30999 만 VM 으로 전달하므로 **6112 TCP, 9000 TCP/UDP 전달 규칙을 공유기에 추가**해야 한다 (서버 관리자에게 요청).
 >
 > 플레이어끼리 게임은 방장 PC 로 직접(P2P, 6112) 접속한다 — 이건 NAS 가 아니라 각 플레이어 PC/공유기 쪽 문제다 (지금과 같음).
 
@@ -61,9 +80,10 @@ data 폴더는 들어 있지 않으므로 올려도 NAS 의 계정·전적이 �
 3. Stacks → **+ Add stack** → Name: `wanggun` → Build method: **Web editor** → `compose.yaml` 내용 전체 붙여 넣기.
    (환경변수는 필요 없다. `game_servers_data` 볼륨은 다른 스택이 쓰는 그 외부 볼륨이다.)
 4. **Deploy the stack**.
-5. Containers → `wanggun-server` 가 running, 1분 뒤 **healthy** 인지 확인. Logs 에 아래가 보이면 정상:
+5. Containers → `wanggun-server` 가 running, 1분 뒤 **healthy** 인지 확인. **unhealthy 면 포트가 겹친 것** — Logs 에서 `[PORT CONFLICT]` 줄을 보고
+   스택을 Stop 한다 (다른 게임 서버는 그대로 동작한다). Logs 에 아래가 보이면 정상:
    ```
-   태조왕건 더미서버 v2.0 시작. Enter 키로 종료.
+   태조왕건 더미서버 v2.1 시작. Enter 키로 종료.
    전적/랭킹 HTTP on port 9010 (/healthz /matches.json /ranking.json)
    UDP listening on port 9000
    TCP listening on port 9000
@@ -73,7 +93,7 @@ data 폴더는 들어 있지 않으므로 올려도 NAS 의 계정·전적이 �
 
 ## 4. 접속 확인
 
-- (VM 안 / 같은 망) 브라우저 `http://<VM 내부 IP>:9010/healthz` → `{"ok": true, "version": "2.0", ...}`
+- (VM 안 / 같은 망) 브라우저 `http://<VM 내부 IP>:9010/healthz` → `{"ok": true, "version": "2.1", "ports": {"tcp/9000": "ok", "tcp/6112": "ok", "udp/9000": "ok"}, ...}`
 - 게임 PC 런처: IP 칸에 **`112.159.73.235`** → **IP 적용** (hosts 의 wanggun.trigger.co.kr 등 3개 도메인이 NAS 로 간다).
   NAS 서버를 쓸 때는 런처의 **서버 시작** 버튼을 누르지 않는다 (그건 내 PC 에 서버를 켜고 hosts 를 127.0.0.1 로 바꾼다).
 - 두 PC 로 방 만들기 → 입장 → 게임 1판 → 끝난 뒤 게임 안 **순위** 에 두 계정이 보이고, `http://<VM>:9010/matches.json` 에 경기 1개가 보이면 완료.
@@ -89,7 +109,7 @@ rtsarena 저장소가 태조왕건을 지원한다 (드롭박스 "태조왕건")
    (같은 볼륨이라 파일을 바로 읽는다, 1분마다 동기화). 기존 `ARENA_UPLOAD_TOKEN` 환경변수는 그대로 둔다.
 3. `http://akansas.synology.me:30013/healthz` 의 `sync.wanggun.error` 가 비어 있으면 연결됨.
 
-## 6. 전적 규칙 (서버 2.0)
+## 6. 전적 규칙 (서버 2.0+)
 
 - 게임이 끝나면 각 플레이어 게임이 0x24FF 로 자기 결과(1 승 / 2 패 / 3 무 / 그 외 = Dis)를 보낸다.
 - 서버는 첫 결과가 올 때 그 방의 참가자 명단으로 경기 1개를 만들고, 나머지 참가자의 결과를 같은 경기에 붙인다 → `data/matches.json`.

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "2.0"
+SERVER_VERSION = "2.1"
 
 TCP_PORTS = [9000, 6112]
 # UDP 6112는 게임의 IPX/P2P 연결 포트다. 서버가 이 포트를 바인딩하면
@@ -533,8 +533,10 @@ class _StatsHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             with lock:
                 n_sessions, n_rooms = len(sessions), len(rooms)
-            self._json({"ok": True, "version": SERVER_VERSION, "sessions": n_sessions,
-                        "rooms": n_rooms, "matches": len(matches)})
+            tcp_ok = all(port_status.get(f"tcp/{p}") == "ok" for p in TCP_PORTS)
+            self._json({"ok": tcp_ok, "version": SERVER_VERSION, "ports": dict(port_status),
+                        "sessions": n_sessions, "rooms": n_rooms, "matches": len(matches)},
+                       200 if tcp_ok else 503)
         elif path == "/matches.json":
             with matches_lock:
                 data = list(matches)
@@ -1595,11 +1597,21 @@ def cleanup_disconnect(conn, addr, port):
     print_state("DISCONNECT")
 
 
+# 포트 상태: /healthz 에 보여 주고, 게임 포트를 하나라도 못 열면 ok=false (NAS 에서 다른 서버와 겹친 것을 바로 알 수 있게).
+port_status = {}
+
+
 def tcp_server(port):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", port))
-    server.listen(20)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # 리눅스: TIME_WAIT 재사용만, 사용 중인 포트는 못 뺏는다
+    try:
+        server.bind(("0.0.0.0", port))
+        server.listen(20)
+    except OSError as e:
+        port_status[f"tcp/{port}"] = f"FAILED: {e}"
+        print(f"[PORT CONFLICT] TCP {port} 를 열 수 없습니다 — 다른 프로그램이 쓰는 중: {e}")
+        return
+    port_status[f"tcp/{port}"] = "ok"
 
     print(f"TCP listening on port {port}")
 
@@ -1684,14 +1696,15 @@ def tcp_server(port):
 
 def udp_server(port):
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEADDR 를 쓰지 않는다: 리눅스 UDP 는 이 옵션이 있으면 다른 프로그램과 같은 포트를 '함께' 열어
+    # 남의 패킷을 나눠 받을 수 있다. 겹치면 그냥 실패하고 로그만 남긴다 (UDP 감청은 필수 아님).
     try:
         server.bind(("0.0.0.0", port))
     except OSError as e:
-        # 6112 UDP는 게임/ipxwrapper가 이미 점유했을 수 있다.
-        # 감청 실패는 치명적이지 않으므로 로그만 남긴다.
-        print(f"UDP bind FAILED port={port}: {e}")
+        port_status[f"udp/{port}"] = f"FAILED: {e}"
+        print(f"[PORT CONFLICT] UDP {port} 를 열 수 없습니다 (치명적이지 않음): {e}")
         return
+    port_status[f"udp/{port}"] = "ok"
 
     print(f"UDP listening on port {port}")
 
