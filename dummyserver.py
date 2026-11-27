@@ -10,7 +10,7 @@ import weakref
 
 # 서버 스크립트 버전 — 시작 배너와 런처에 표시된다.
 # 어떤 버전이 실제로 돌고 있는지 확인하는 용도이므로 수정 시 반드시 올릴 것.
-SERVER_VERSION = "1.8"
+SERVER_VERSION = "1.9"
 
 TCP_PORTS = [9000, 6112]
 # UDP 6112는 게임의 IPX/P2P 연결 포트다. 서버가 이 포트를 바인딩하면
@@ -23,7 +23,8 @@ MAX_PACKET_SIZE = 8192
 ROOM_TTL_SECONDS = 10 * 60
 DEFAULT_CHANNEL_NAME = b"\xf7\xbc\xf0\xd5\xe8\xdd\xcb\xef\x00"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(
+# NAS/Docker 등 리눅스에서는 WANGGUN_DATA_DIR로 계정·로그 저장 위치를 지정한다.
+STATE_DIR = os.environ.get("WANGGUN_DATA_DIR") or os.path.join(
     os.environ.get("LOCALAPPDATA", BASE_DIR),
     "TaejoWanggeonDummyServer",
 )
@@ -1450,7 +1451,11 @@ def main():
     for port in TCP_PORTS:
         threading.Thread(target=tcp_server, args=(port,), daemon=True).start()
 
-    input()
+    # 콘솔 실행: Enter로 종료. NAS/Docker처럼 표준입력이 없으면(EOF) 계속 실행한다.
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        threading.Event().wait()
 
 
 if __name__ == "__main__":
